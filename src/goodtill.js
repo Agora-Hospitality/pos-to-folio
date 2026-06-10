@@ -177,7 +177,9 @@ function nicosiaOffsetMs(utcMs) {
  * Returns null for unparsable input so callers can choose their fallback.
  */
 function cyprusLocalToUtcIso(localStr) {
-  const m = String(localStr || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  // Fully anchored: a zone-suffixed timestamp ("...Z", "...+03:00") must fall
+  // through to the caller's fallback rather than be silently re-shifted by 3h.
+  const m = String(localStr || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?$/);
   if (!m) return null;
   const wallUtc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
   // Guess-and-correct: take the offset at the wall-clock instant, then refine
