@@ -10,7 +10,7 @@
  * 5. Post the order to MEWS linked to that reservation
  */
 
-const { fetchSales, fetchSaleById, formatDateTime, extractGuestFolioSales, parseRoomNumber } = require('./goodtill');
+const { fetchSales, fetchSaleById, formatDateTime, cyprusLocalToUtcIso, extractGuestFolioSales, parseRoomNumber } = require('./goodtill');
 const { getResourcesAndRoomMap, getActiveReservationForRoom, findFBService, findFBAccountingCategory, addOrder, deleteExternalPayments, getOrderItems, cancelOrderItems } = require('./mews');
 const { SalesStore } = require('./store');
 const { fullSync, getRoomByCustomerId } = require('./roster');
@@ -337,9 +337,10 @@ async function processSale(sale, saleId, folioAmount, otherPayments = []) {
     accountingCategoryId: fbAccountingCategoryId,
     items,
     notes: `POS Sale #${saleRef} — ${roomNumber}`,
-    consumptionUtc: sale.sales_date_time
-      ? new Date(sale.sales_date_time).toISOString()
-      : new Date().toISOString(),
+    // sales_date_time is Cyprus-local with no zone marker — convert it
+    // properly. new Date(...) here would parse it as UTC on the Railway host
+    // and stamp MEWS with the wall clock relabeled "Z" (+3h in DST).
+    consumptionUtc: cyprusLocalToUtcIso(sale.sales_date_time) || new Date().toISOString(),
     currency: process.env.CURRENCY || 'EUR',
   });
 
