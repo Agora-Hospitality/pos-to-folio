@@ -35,8 +35,15 @@ const LOOKBACK_MINUTES = parseInt(process.env.POLL_LOOKBACK_MINUTES || '30', 10)
 // Unpostable sales (dead-letter) are retried this long after first being seen...
 const DEAD_LETTER_RETRY_WINDOW_HOURS = parseInt(process.env.DEAD_LETTER_RETRY_WINDOW_HOURS || '24', 10);
 // ...at most once per interval (a guest checking in mid-morning makes the
-// room postable, so frequent early retries pay off; hammering doesn't).
+// room postable, so frequent early retries pay off; hammering doesn't)...
 const DEAD_LETTER_RETRY_INTERVAL_MS = parseInt(process.env.DEAD_LETTER_RETRY_INTERVAL_MS || String(15 * 60 * 1000), 10);
+// ...and at most this many times in total (bounds duplicate-charge exposure
+// if MEWS orders/add ever commits server-side but errors client-side).
+const DEAD_LETTER_MAX_ATTEMPTS = parseInt(process.env.DEAD_LETTER_MAX_ATTEMPTS || '40', 10);
+// Reentrancy guard: setInterval ticks, POST /poll, and webhooks can otherwise
+// overlap, and processSale never re-checks store.has after its first await —
+// concurrent runs are the realistic double-post path.
+let _polling = false;
 // How far back to check for voids (in hours) — posted sales within this window are re-queried each void-detection pass
 const VOID_DETECT_WINDOW_HOURS = parseInt(process.env.VOID_DETECT_WINDOW_HOURS || '48', 10);
 // Run void detection at most once every N ms (throttle, since it makes one API call per unreversed sale)
@@ -84,6 +91,19 @@ function getResourceToRoom() { return resourceToRoom; }
  * Run a single poll cycle
  */
 async function pollOnce() {
+  if (_polling) {
+    console.log('[bridge] Poll already in flight — skipping this tick');
+    return;
+  }
+  _polling = true;
+  try {
+    await pollOnceInner();
+  } finally {
+    _polling = false;
+  }
+}
+
+async function pollOnceInner() {
   const now = new Date();
   const from = new Date(now.getTime() - LOOKBACK_MINUTES * 60 * 1000);
 
@@ -171,6 +191,7 @@ async function retryDeadLetters() {
   const candidates = deadLetter.retryCandidates(
     DEAD_LETTER_RETRY_WINDOW_HOURS * 60 * 60 * 1000,
     DEAD_LETTER_RETRY_INTERVAL_MS,
+    DEAD_LETTER_MAX_ATTEMPTS,
   );
   if (candidates.length === 0) return;
 
@@ -195,7 +216,21 @@ async function retryDeadLetters() {
 
     const matches = extractGuestFolioSales([sale]);
     if (matches.length === 0) {
-      deadLetter.resolve(saleId, 'no longer a guest-folio sale');
+      // Only conclude "no longer a folio sale" from positive evidence: a
+      // COMPLETED sale whose payments visibly lack a folio tender. The by-id
+      // response shape may omit sales_payments — that proves nothing.
+      const status = String(sale.order_status || '').toUpperCase();
+      const payments = sale.sales_payments && typeof sale.sales_payments === 'object' ? sale.sales_payments : null;
+      const keys = payments ? Object.keys(payments) : [];
+      const hasFolioKey = keys.some((k) => {
+        const kk = k.toLowerCase();
+        return kk === 'custom_1' || kk.includes('guest folio') || kk.includes('room charge');
+      });
+      if (keys.length > 0 && !hasFolioKey && status === 'COMPLETED') {
+        deadLetter.resolve(saleId, 'no longer a guest-folio sale');
+      } else {
+        deadLetter.record(saleId, {}, `by-id response inconclusive (status ${status || 'unknown'}, ${keys.length} payment keys) — left open`);
+      }
       continue;
     }
     if (matches[0].voided) {
@@ -209,7 +244,10 @@ async function retryDeadLetters() {
       const posted = await processSale(sale, saleId, matches[0].folioAmount, matches[0].otherPayments);
       if (posted) recovered++;
     } catch (err) {
+      // Bump lastTriedAt/attempts so a thrown failure (MEWS lookup/addOrder
+      // error) is throttled like any other — not re-attempted every 60s tick.
       console.error(`[bridge] dead-letter: error reprocessing sale ${saleId}:`, err.message);
+      deadLetter.record(saleId, {}, `retry error: ${err.message}`);
     }
   }
 
@@ -435,11 +473,16 @@ async function processSale(sale, saleId, folioAmount, otherPayments = []) {
  * without opening Goodtill.
  */
 function deadLetterInfo(sale, folioAmount) {
+  // folioAmount is bill-only (tips live in tips_obj metadata) — report the tip
+  // too so a tip-only sale doesn't read as "nothing owed".
+  const tipAmount = extractTipAmount(sale);
   return {
     receipt: sale.receipt_no || sale.receipt_number || '',
     customer: sale.customer?.name || sale.customer_name || sale.sales_details?.customer_name || '',
     saleTimeLocal: sale.sales_date_time || '',
     folioAmount,
+    tipAmount,
+    totalAtStake: Math.round((folioAmount + tipAmount) * 100) / 100,
   };
 }
 

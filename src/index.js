@@ -49,7 +49,13 @@ app.get('/health/goodtill', async (_req, res) => {
 // Guest Folio sales the bridge could not post (no customer / room / checked-in
 // reservation). Unresolved entries are retried automatically for a bounded
 // window; whatever remains here needs a human (re-key on MEWS or write off).
-app.get('/dead-letter', (_req, res) => {
+// Token-gated: the payload contains guest names and spend, unlike the other
+// no-auth endpoints which return no data.
+app.get('/dead-letter', (req, res) => {
+  const token = process.env.BRIDGE_ADMIN_TOKEN || '';
+  if (!token || req.get('X-Bridge-Token') !== token) {
+    return res.status(403).json({ error: 'forbidden — set BRIDGE_ADMIN_TOKEN and send it as X-Bridge-Token' });
+  }
   const entries = getDeadLetterEntries();
   res.json({ count: entries.length, entries });
 });

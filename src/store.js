@@ -177,13 +177,19 @@ class DeadLetterStore {
     const id = String(saleId);
     const prev = this.entries.get(id);
     const nowIso = new Date().toISOString();
+    // Merge over the previous entry so a sparse re-record (e.g. a transient
+    // 404 path passing info={}) never wipes receipt/customer/amount context.
     const entry = {
-      firstSeenAt: prev?.firstSeenAt || nowIso,
+      ...prev,
       ...info,
+      firstSeenAt: prev?.firstSeenAt || nowIso,
       reason,
       attempts: (prev?.attempts || 0) + 1,
       lastTriedAt: nowIso,
     };
+    // Re-recording deliberately reopens a resolved entry — the sale failed again.
+    delete entry.resolvedAt;
+    delete entry.resolution;
     this.entries.set(id, entry);
     this._save();
   }
@@ -220,18 +226,22 @@ class DeadLetterStore {
   }
 
   /**
-   * Unresolved entries due for a retry: first seen within maxAgeMs and not
-   * tried within the last minIntervalMs. Older entries stay visible in
-   * unresolved() but are no longer retried automatically.
+   * Unresolved entries due for a retry: first seen within maxAgeMs, not tried
+   * within the last minIntervalMs, and under the attempts cap (bounds the
+   * MEWS double-submit exposure when addOrder commits server-side but throws
+   * client-side). Capped/aged-out entries stay visible in unresolved() but are
+   * no longer retried automatically.
    * @param {number} maxAgeMs
    * @param {number} minIntervalMs
+   * @param {number} [maxAttempts]
    * @returns {Array<[string, Record<string, any>]>}
    */
-  retryCandidates(maxAgeMs, minIntervalMs) {
+  retryCandidates(maxAgeMs, minIntervalMs, maxAttempts = 40) {
     const now = Date.now();
     const out = [];
     for (const [id, e] of this.entries) {
       if (e.resolvedAt) continue;
+      if ((e.attempts || 0) >= maxAttempts) continue;
       const firstSeen = Date.parse(e.firstSeenAt);
       const lastTried = Date.parse(e.lastTriedAt || e.firstSeenAt);
       if (!Number.isFinite(firstSeen) || now - firstSeen > maxAgeMs) continue;
