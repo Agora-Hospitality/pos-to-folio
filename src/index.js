@@ -10,7 +10,7 @@
 require('dotenv').config();
 const crypto = require('node:crypto');
 const express = require('express');
-const { init, startPolling, stopPolling, pollOnce, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale } = require('./bridge');
+const { init, startPolling, stopPolling, pollOnce, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries } = require('./bridge');
 const { handleReservationUpdate, fullSync } = require('./roster');
 const { post: mewsPost } = require('./mews');
 const { ping: goodtillPing } = require('./goodtill');
@@ -44,6 +44,20 @@ app.get('/health/goodtill', async (_req, res) => {
   } catch (err) {
     res.status(503).json({ status: 'error', goodtill: 'error', message: err.message });
   }
+});
+
+// Guest Folio sales the bridge could not post (no customer / room / checked-in
+// reservation). Unresolved entries are retried automatically for a bounded
+// window; whatever remains here needs a human (re-key on MEWS or write off).
+// Token-gated: the payload contains guest names and spend, unlike the other
+// no-auth endpoints which return no data.
+app.get('/dead-letter', (req, res) => {
+  const token = process.env.BRIDGE_ADMIN_TOKEN || '';
+  if (!token || req.get('X-Bridge-Token') !== token) {
+    return res.status(403).json({ error: 'forbidden — set BRIDGE_ADMIN_TOKEN and send it as X-Bridge-Token' });
+  }
+  const entries = getDeadLetterEntries();
+  res.json({ count: entries.length, entries });
 });
 
 // ─── Manual triggers ──────────────────────────────────────────────────
