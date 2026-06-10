@@ -12,7 +12,7 @@
 
 const { fetchSales, fetchSaleById, formatDateTime, extractGuestFolioSales, parseRoomNumber } = require('./goodtill');
 const { getResourcesAndRoomMap, getActiveReservationForRoom, findFBService, findFBAccountingCategory, addOrder, deleteExternalPayments, getOrderItems, cancelOrderItems } = require('./mews');
-const { SalesStore } = require('./store');
+const { SalesStore, DeadLetterStore } = require('./store');
 const { fullSync, getRoomByCustomerId } = require('./roster');
 
 /** @type {Map<string, string>} room name → MEWS resource ID */
@@ -25,11 +25,18 @@ let fbServiceId = null;
 let fbAccountingCategoryId = null;
 /** @type {SalesStore} */
 let store;
+/** @type {DeadLetterStore} */
+let deadLetter;
 /** @type {ReturnType<typeof setInterval>|null} */
 let pollTimer = null;
 
 // How far back to look on each poll cycle (in minutes)
 const LOOKBACK_MINUTES = parseInt(process.env.POLL_LOOKBACK_MINUTES || '30', 10);
+// Unpostable sales (dead-letter) are retried this long after first being seen...
+const DEAD_LETTER_RETRY_WINDOW_HOURS = parseInt(process.env.DEAD_LETTER_RETRY_WINDOW_HOURS || '24', 10);
+// ...at most once per interval (a guest checking in mid-morning makes the
+// room postable, so frequent early retries pay off; hammering doesn't).
+const DEAD_LETTER_RETRY_INTERVAL_MS = parseInt(process.env.DEAD_LETTER_RETRY_INTERVAL_MS || String(15 * 60 * 1000), 10);
 // How far back to check for voids (in hours) — posted sales within this window are re-queried each void-detection pass
 const VOID_DETECT_WINDOW_HOURS = parseInt(process.env.VOID_DETECT_WINDOW_HOURS || '48', 10);
 // Run void detection at most once every N ms (throttle, since it makes one API call per unreversed sale)
@@ -42,6 +49,7 @@ let _lastVoidDetectAt = 0;
  */
 async function init() {
   store = new SalesStore();
+  deadLetter = new DeadLetterStore();
 
   console.log('[bridge] Loading MEWS configuration...');
   const [roomData, serviceId, catId] = await Promise.all([
@@ -141,6 +149,72 @@ async function pollOnce() {
     } catch (err) {
       console.error('[bridge] Void detection error:', err.message);
     }
+  }
+
+  // Retry sales the bridge previously could not post (no customer attached,
+  // room missing, no checked-in reservation). Without this, a sale that aged
+  // out of the poll lookback was dropped forever with only a console.warn.
+  try {
+    await retryDeadLetters();
+  } catch (err) {
+    console.error('[bridge] Dead-letter retry error:', err.message);
+  }
+}
+
+/**
+ * Re-attempt every unresolved dead-letter sale that is due for a retry.
+ * Resolution paths: posted (processSale succeeds), voided on POS, no longer a
+ * folio sale, or already in the processed store. Entries older than the retry
+ * window stay listed at GET /dead-letter for ops but are not retried.
+ */
+async function retryDeadLetters() {
+  const candidates = deadLetter.retryCandidates(
+    DEAD_LETTER_RETRY_WINDOW_HOURS * 60 * 60 * 1000,
+    DEAD_LETTER_RETRY_INTERVAL_MS,
+  );
+  if (candidates.length === 0) return;
+
+  let recovered = 0;
+  for (const [saleId] of candidates) {
+    if (store.has(saleId)) {
+      deadLetter.resolve(saleId, 'already posted');
+      continue;
+    }
+
+    let sale;
+    try {
+      sale = await fetchSaleById(saleId);
+    } catch (err) {
+      console.error(`[bridge] dead-letter: error fetching sale ${saleId}:`, err.message);
+      continue;
+    }
+    if (!sale) {
+      deadLetter.record(saleId, {}, 'sale not found in Goodtill (404)');
+      continue;
+    }
+
+    const matches = extractGuestFolioSales([sale]);
+    if (matches.length === 0) {
+      deadLetter.resolve(saleId, 'no longer a guest-folio sale');
+      continue;
+    }
+    if (matches[0].voided) {
+      deadLetter.resolve(saleId, 'voided on POS');
+      continue;
+    }
+
+    try {
+      // processSale resolves the entry on success and re-records (with a fresh
+      // lastTriedAt, which throttles the next attempt) on failure.
+      const posted = await processSale(sale, saleId, matches[0].folioAmount, matches[0].otherPayments);
+      if (posted) recovered++;
+    } catch (err) {
+      console.error(`[bridge] dead-letter: error reprocessing sale ${saleId}:`, err.message);
+    }
+  }
+
+  if (recovered) {
+    console.log(`[bridge] Dead-letter retry: recovered ${recovered} sale(s)`);
   }
 }
 
@@ -248,6 +322,7 @@ async function processSale(sale, saleId, folioAmount, otherPayments = []) {
   if (!roomNumber) {
     const custName = sale.customer?.name || sale.customer_name || sale.sales_details?.customer_name || '';
     console.warn(`[bridge] Sale ${saleId}: no room matched — customer_id="${gtCustomerId || 'null'}", customer_name="${custName}", skipping`);
+    deadLetter.record(saleId, deadLetterInfo(sale, folioAmount), 'no room matched (no customer attached to sale)');
     return false;
   }
 
@@ -256,6 +331,7 @@ async function processSale(sale, saleId, folioAmount, otherPayments = []) {
     const resourceId = roomMap.get(roomNumber);
     if (!resourceId) {
       console.error(`[bridge] Sale ${saleId}: room "${roomNumber}" not found in MEWS`);
+      deadLetter.record(saleId, deadLetterInfo(sale, folioAmount), `room "${roomNumber}" not found in MEWS`);
       return false;
     }
     reservation = await getActiveReservationForRoom(resourceId);
@@ -263,6 +339,7 @@ async function processSale(sale, saleId, folioAmount, otherPayments = []) {
 
   if (!reservation) {
     console.error(`[bridge] Sale ${saleId}: no checked-in reservation found for room ${roomNumber}`);
+    deadLetter.record(saleId, deadLetterInfo(sale, folioAmount), `no checked-in reservation for room ${roomNumber}`);
     return false;
   }
 
@@ -348,8 +425,22 @@ async function processSale(sale, saleId, folioAmount, otherPayments = []) {
   // 5. Mark as processed. paymentIds stays empty for new entries — kept in the
   // store schema for back-compat with pre-fix entries that still have them.
   store.add(saleId, mewsOrderId, []);
+  deadLetter.resolve(saleId, 'posted');
   console.log(`[bridge] ✓ Sale ${saleRef} posted to MEWS (order ${mewsOrderId || 'ok'})`);
   return true;
+}
+
+/**
+ * Context captured with a dead-letter entry so ops can identify the sale
+ * without opening Goodtill.
+ */
+function deadLetterInfo(sale, folioAmount) {
+  return {
+    receipt: sale.receipt_no || sale.receipt_number || '',
+    customer: sale.customer?.name || sale.customer_name || sale.sales_details?.customer_name || '',
+    saleTimeLocal: sale.sales_date_time || '',
+    folioAmount,
+  };
 }
 
 /**
@@ -562,4 +653,9 @@ async function handleCompletedSale(saleId) {
   }
 }
 
-module.exports = { init, pollOnce, startPolling, stopPolling, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale };
+/** Unresolved dead-letter entries for the /dead-letter endpoint */
+function getDeadLetterEntries() {
+  return deadLetter ? deadLetter.unresolved() : [];
+}
+
+module.exports = { init, pollOnce, startPolling, stopPolling, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries };
