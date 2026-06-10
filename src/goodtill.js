@@ -150,6 +150,44 @@ function formatDateTime(d) {
 }
 
 /**
+ * Offset of Europe/Nicosia vs UTC at the given UTC instant, in milliseconds.
+ */
+function nicosiaOffsetMs(utcMs) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/Nicosia',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(new Date(utcMs));
+  const get = (type) => Number(parts.find((p) => p.type === type)?.value || 0);
+  return Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second')) - utcMs;
+}
+
+/**
+ * Convert a Goodtill local timestamp ("YYYY-MM-DD HH:MM:SS", Europe/Nicosia)
+ * to a true-UTC ISO string. The inverse of formatDateTime().
+ *
+ * The bridge used to do `new Date(sale.sales_date_time).toISOString()`, which
+ * parses the zone-less local string as UTC on a UTC host (Railway). Every MEWS
+ * ConsumedUtc came out as the Cyprus wall clock relabeled "Z" — +3h ahead of
+ * the true instant in DST, +2h in winter. Any UTC-windowed consumer (the
+ * agora-app guest-folio reconciliation) then saw 07:00–09:59-local sales in
+ * the NEXT service day, and bridge posts looked ~3h late in MEWS.
+ *
+ * Returns null for unparsable input so callers can choose their fallback.
+ */
+function cyprusLocalToUtcIso(localStr) {
+  const m = String(localStr || '').match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return null;
+  const wallUtc = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  // Guess-and-correct: take the offset at the wall-clock instant, then refine
+  // once so timestamps next to a DST transition resolve with the right offset.
+  let utc = wallUtc - nicosiaOffsetMs(wallUtc);
+  utc = wallUtc - nicosiaOffsetMs(utc);
+  return new Date(utc).toISOString();
+}
+
+/**
  * Filter sales that used "Guest Folio" as a payment method.
  * Returns objects with { sale, roomNumber } where roomNumber is extracted
  * from the guest/customer name field.
@@ -261,6 +299,7 @@ module.exports = {
   fetchSales,
   fetchSaleById,
   formatDateTime,
+  cyprusLocalToUtcIso,
   extractGuestFolioSales,
   parseRoomNumber,
   listCustomers,
