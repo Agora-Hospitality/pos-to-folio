@@ -95,9 +95,16 @@ src/
 └── store.js      — Processed-sales dedup tracker (file-based)
 ```
 
-## Duplicate Prevention
+## Duplicate Prevention & Void Reversal
 
-Processed sales are tracked in `data/processed-sales.json`. This file persists across restarts so the same sale is never posted twice. The `data/` directory is gitignored.
+Processed sales are tracked in `data/processed-sales.json` (and unpostable sales in `data/dead-letter.json`). This store is the bridge's **only** record of which POS sale maps to which MEWS order, so two things depend on it:
+
+- **No double-posting** — a sale already in the store is never posted twice.
+- **Void reversal** — when a sale is voided in SumUp, `detectVoids()` finds its stored MEWS order and cancels it. If the store is lost, the bridge no longer knows which MEWS order to cancel, and **the void silently fails to reverse**.
+
+> ⚠️ **The store must live on persistent storage.** The `data/` directory is gitignored, and on a host with an ephemeral filesystem (e.g. Railway without a volume) **every redeploy or restart wipes it**. Set `DATA_DIR` to a mounted volume in production.
+>
+> **Railway:** add a Volume to the service, set its mount path to `/data`, and set `DATA_DIR=/data`. Verify with `GET /health` — `store.dataDir` should read `/data` and `store.processedSales` should stay non-zero across deploys (a reset to `0` after each deploy means the volume isn't mounted).
 
 Bridge-managed Goodtill customer profiles are tagged with `source: "mews-bridge"` and `custom_field_1: "mews:<reservationId>"` to distinguish them from manually-created customers.
 

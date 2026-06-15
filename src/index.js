@@ -10,7 +10,7 @@
 require('dotenv').config();
 const crypto = require('node:crypto');
 const express = require('express');
-const { init, startPolling, stopPolling, pollOnce, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries } = require('./bridge');
+const { init, startPolling, stopPolling, pollOnce, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries, getStoreStats } = require('./bridge');
 const { handleReservationUpdate, fullSync } = require('./roster');
 const { post: mewsPost } = require('./mews');
 const { ping: goodtillPing } = require('./goodtill');
@@ -25,7 +25,9 @@ const GOODTILL_WEBHOOK_TOKEN = process.env.GOODTILL_WEBHOOK_TOKEN || '';
 // ─── Health check ─────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime() });
+  // `store` lets ops confirm persistence: dataDir should be the mounted volume
+  // path and processedSales should survive redeploys (a reset to 0 = no volume).
+  res.json({ status: 'ok', uptime: process.uptime(), store: getStoreStats() });
 });
 
 app.get('/health/mews', async (_req, res) => {

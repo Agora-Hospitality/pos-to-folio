@@ -7,7 +7,17 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-const DEFAULT_PATH = path.resolve(process.cwd(), 'data', 'processed-sales.json');
+// Directory holding the persisted dedup/void-tracking stores
+// (processed-sales.json, dead-letter.json). On Railway this MUST point at a
+// mounted volume (set DATA_DIR=/data) — these files are the bridge's only record
+// of which POS sale maps to which MEWS order, and BOTH void-reversal and
+// double-post protection depend on them surviving redeploys. Defaults to ./data
+// for local dev.
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.resolve(process.cwd(), 'data');
+
+const DEFAULT_PATH = path.join(DATA_DIR, 'processed-sales.json');
 
 class SalesStore {
   /**
@@ -31,6 +41,11 @@ class SalesStore {
           this.processed.set(k, v);
         }
         console.log(`[store] Loaded ${this.processed.size} processed sales from disk`);
+      } else {
+        // No file = first boot OR a wiped/unmounted volume. The latter silently
+        // breaks void-reversal (detectVoids has nothing to check) and risks
+        // double-posting, so make it loud and actionable rather than a no-op.
+        console.warn(`[store] No processed-sales file at ${this.filePath} — starting EMPTY. On Railway this is normal only on first boot; if it recurs after every deploy, DATA_DIR (${DATA_DIR}) is NOT on a persistent volume and voids will silently fail to reverse.`);
       }
     } catch (err) {
       console.error('[store] Failed to load processed sales:', err.message);
@@ -117,7 +132,7 @@ class SalesStore {
   }
 }
 
-const DEAD_LETTER_PATH = path.resolve(process.cwd(), 'data', 'dead-letter.json');
+const DEAD_LETTER_PATH = path.join(DATA_DIR, 'dead-letter.json');
 
 /**
  * Dead-letter tracker for Guest Folio sales the bridge could NOT post
@@ -151,6 +166,8 @@ class DeadLetterStore {
         }
         const open = [...this.entries.values()].filter((e) => !e.resolvedAt).length;
         console.log(`[dead-letter] Loaded ${this.entries.size} entries (${open} unresolved) from disk`);
+      } else {
+        console.log(`[dead-letter] No store file at ${this.filePath} — starting empty.`);
       }
     } catch (err) {
       console.error('[dead-letter] Failed to load:', err.message);
@@ -252,4 +269,4 @@ class DeadLetterStore {
   }
 }
 
-module.exports = { SalesStore, DeadLetterStore };
+module.exports = { SalesStore, DeadLetterStore, DATA_DIR };
