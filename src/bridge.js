@@ -12,7 +12,7 @@
 
 const { fetchSales, fetchSaleById, formatDateTime, cyprusLocalToUtcIso, extractGuestFolioSales, parseRoomNumber } = require('./goodtill');
 const { getResourcesAndRoomMap, getActiveReservationForRoom, findFBService, findFBAccountingCategory, addOrder, deleteExternalPayments, getOrderItems, cancelOrderItems } = require('./mews');
-const { SalesStore, DeadLetterStore } = require('./store');
+const { SalesStore, DeadLetterStore, DATA_DIR } = require('./store');
 const { fullSync, getRoomByCustomerId } = require('./roster');
 
 /** @type {Map<string, string>} room name → MEWS resource ID */
@@ -702,4 +702,19 @@ function getDeadLetterEntries() {
   return deadLetter ? deadLetter.unresolved() : [];
 }
 
-module.exports = { init, pollOnce, startPolling, stopPolling, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries };
+/**
+ * Persistence stats for the /health endpoint. Lets ops confirm the store sits on
+ * a durable volume: `dataDir` should be the mounted path (e.g. /data) and
+ * `processedSales` should stay non-zero across redeploys. A count that resets to
+ * 0 after every deploy means the volume is not mounted — and voids will silently
+ * stop reversing.
+ */
+function getStoreStats() {
+  return {
+    dataDir: DATA_DIR,
+    processedSales: store ? store.size : 0,
+    deadLetterOpen: deadLetter ? deadLetter.unresolved().length : 0,
+  };
+}
+
+module.exports = { init, pollOnce, startPolling, stopPolling, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries, getStoreStats };
