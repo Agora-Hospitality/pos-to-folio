@@ -40,10 +40,18 @@ const DEAD_LETTER_RETRY_INTERVAL_MS = parseInt(process.env.DEAD_LETTER_RETRY_INT
 // ...and at most this many times in total (bounds duplicate-charge exposure
 // if MEWS orders/add ever commits server-side but errors client-side).
 const DEAD_LETTER_MAX_ATTEMPTS = parseInt(process.env.DEAD_LETTER_MAX_ATTEMPTS || '40', 10);
-// Reentrancy guard: setInterval ticks, POST /poll, and webhooks can otherwise
-// overlap, and processSale never re-checks store.has after its first await —
-// concurrent runs are the realistic double-post path.
+// Cycle-level reentrancy guard: stops setInterval ticks and POST /poll from
+// stacking whole poll cycles. Webhooks never take this guard — per-sale
+// double-post protection is _inFlightSales below.
 let _polling = false;
+// Per-sale guard for the money-moving paths. The poll tick, POST /poll,
+// dead-letter retries, and Goodtill webhooks can all reach processSale /
+// reverseSale for the same sale concurrently; webhook-vs-poll is the confirmed
+// double-post path (2026-06-25 €5.80 and 2026-07-02 receipt #1782990088859 —
+// two MEWS orders posted the same second, manually corrected by reception).
+// First caller in wins, later callers bail; dropping the loser is safe because
+// every calling path re-runs on its own schedule.
+const _inFlightSales = new Set();
 // How far back to check for voids (in hours) — posted sales within this window are re-queried each void-detection pass
 const VOID_DETECT_WINDOW_HOURS = parseInt(process.env.VOID_DETECT_WINDOW_HOURS || '48', 10);
 // Run void detection at most once every N ms (throttle, since it makes one API call per unreversed sale)
@@ -158,10 +166,11 @@ async function pollOnceInner() {
 
   // Void-detection fallback: Goodtill's /external/get_sales_details list endpoint
   // only returns COMPLETED sales, so voids never appear in pollOnce above. And
-  // Goodtill's sale.voided webhook is unreliable — we've seen zero webhook
-  // deliveries despite subscribing. So we also poll each unreversed store entry
-  // individually and check its current order_status. Throttled to avoid hammering
-  // the Goodtill API.
+  // Goodtill webhook delivery is best-effort: sale.completed demonstrably fires
+  // nowadays (it raced this poll loop into two real double-posts), but voids
+  // cannot rely on it. So we also poll each unreversed store entry individually
+  // and check its current order_status. Throttled to avoid hammering the
+  // Goodtill API.
   if (Date.now() - _lastVoidDetectAt >= VOID_DETECT_INTERVAL_MS) {
     _lastVoidDetectAt = Date.now();
     try {
@@ -330,6 +339,24 @@ async function detectVoids() {
  * @param {Array<{method: string, amount: number}>} [otherPayments] - Non-folio payments (Card/Cash)
  */
 async function processSale(sale, saleId, folioAmount, otherPayments = []) {
+  const id = String(saleId);
+  if (_inFlightSales.has(id)) {
+    console.log(`[bridge] Sale ${id}: already being processed by a concurrent path — skipping`);
+    return false;
+  }
+  // Callers check store.has before their own awaits, so their checks can be
+  // stale by the time execution reaches here. This one is atomic with taking
+  // the guard (no await in between).
+  if (store.has(id)) return false;
+  _inFlightSales.add(id);
+  try {
+    return await processSaleInner(sale, id, folioAmount, otherPayments);
+  } finally {
+    _inFlightSales.delete(id);
+  }
+}
+
+async function processSaleInner(sale, saleId, folioAmount, otherPayments = []) {
   // Primary: look up room from the sale's customer_id (roster-synced profile)
   const gtCustomerId = sale.customer_id;
   let roomNumber = null;
@@ -443,6 +470,14 @@ async function processSale(sale, saleId, folioAmount, otherPayments = []) {
   }
 
   // 4. Post to MEWS
+  // Last line of defence before money moves: a concurrent path may have posted
+  // this sale while we awaited the reservation lookup. The in-flight guard in
+  // processSale should make this unreachable — re-check anyway; this exact
+  // race (webhook vs poll) has double-posted real charges before.
+  if (store.has(saleId)) {
+    console.warn(`[bridge] Sale ${saleRef}: already posted by a concurrent path — skipping duplicate MEWS order`);
+    return false;
+  }
   console.log(`[bridge] Posting sale ${saleRef} (room ${roomNumber}${isSplit ? `, split — folio €${folioAmount.toFixed(2)}` : ''}) to reservation ${reservation.Id}`);
 
   const result = await addOrder({
@@ -494,6 +529,23 @@ function deadLetterInfo(sale, folioAmount) {
  * @param {{ mewsOrderId?: string }} entry - The store entry for this sale
  */
 async function reverseSale(sale, saleId, entry) {
+  const id = String(saleId);
+  if (_inFlightSales.has(id)) {
+    console.log(`[bridge] Sale ${id}: already being processed/reversed by a concurrent path — skipping reverse`);
+    return false;
+  }
+  // Re-read the entry: the caller's copy may predate a concurrent reversal.
+  const fresh = store.get(id) || entry;
+  if (fresh.reversedAt) return false;
+  _inFlightSales.add(id);
+  try {
+    return await reverseSaleInner(sale, id, fresh);
+  } finally {
+    _inFlightSales.delete(id);
+  }
+}
+
+async function reverseSaleInner(sale, saleId, entry) {
   const saleRef = sale.receipt_no || sale.receipt_number || saleId;
 
   if (!entry.mewsOrderId) {
@@ -717,4 +769,12 @@ function getStoreStats() {
   };
 }
 
-module.exports = { init, pollOnce, startPolling, stopPolling, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries, getStoreStats };
+/**
+ * Test hook: the live SalesStore instance (created by init). Lets the
+ * double-post regression tests mark a sale processed mid-flight, simulating a
+ * concurrent path the in-flight guard cannot see (another replica, manual
+ * re-key). Not for production use.
+ */
+function _getStoreForTests() { return store; }
+
+module.exports = { init, pollOnce, startPolling, stopPolling, getRoomMap, getResourceToRoom, handleVoidedSale, handleCompletedSale, getDeadLetterEntries, getStoreStats, _getStoreForTests };
