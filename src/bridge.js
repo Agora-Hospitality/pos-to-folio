@@ -12,6 +12,7 @@
 
 const { fetchSales, fetchSaleById, formatDateTime, cyprusLocalToUtcIso, extractGuestFolioSales, parseRoomNumber } = require('./goodtill');
 const { getResourcesAndRoomMap, getActiveReservationForRoom, findFBService, findFBAccountingCategory, addOrder, deleteExternalPayments, getOrderItems, cancelOrderItems } = require('./mews');
+const { notifyAppOfFolioSale } = require('./app-ingest');
 const { SalesStore, DeadLetterStore, DATA_DIR } = require('./store');
 const { fullSync, getRoomByCustomerId } = require('./roster');
 
@@ -501,6 +502,20 @@ async function processSaleInner(sale, saleId, folioAmount, otherPayments = []) {
   store.add(saleId, mewsOrderId, []);
   deadLetter.resolve(saleId, 'posted');
   console.log(`[bridge] ✓ Sale ${saleRef} posted to MEWS (order ${mewsOrderId || 'ok'})`);
+
+  // Phase-2 guest platform: ship the itemized lines to the Agora app so the
+  // Guest 360 shows spend + favourites. Fire-and-forget — never blocks money.
+  const tipFolioForApp = isSplit ? Math.min(tipTotal, folioAmount) : tipTotal;
+  const fnbGrossForApp = isSplit
+    ? Math.round((folioAmount - tipFolioForApp) * 100) / 100
+    : saleTotal;
+  notifyAppOfFolioSale(sale, saleId, {
+    roomNumber,
+    reservation,
+    fnbGross: fnbGrossForApp,
+    tipGross: tipFolioForApp,
+    saleTimeUtcIso: cyprusLocalToUtcIso(sale.sales_date_time) || new Date().toISOString(),
+  }).catch(() => {});
   return true;
 }
 
