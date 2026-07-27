@@ -41,6 +41,10 @@ async function notifyAppOfFolioSale(sale, saleId, ctx) {
     mewsCustomerId: ctx.reservation?.AccountId || ctx.reservation?.CustomerId || null,
     grossTotal: ctx.fnbGross,
     tipGross: ctx.tipGross,
+    // Diners on the bill, as keyed at the till. The app shows covers and spend
+    // per head on the guest profile and divides shared lines by it for
+    // favourites — without it every folio bill reads "covers not recorded".
+    coverCount: parseInt(sale.total_cover, 10) || null,
     currency: process.env.CURRENCY || 'EUR',
     source: 'bridge',
     lines: items.map((it) => ({
