@@ -53,6 +53,13 @@ async function notifyAppOfFolioSale(sale, saleId, ctx) {
       qty: parseFloat(it.quantity) || 0,
       gross: (parseFloat(it.price_inc_vat_per_item) || 0) * (parseFloat(it.quantity) || 0),
       category: it.category_name || null,
+      // How the guest asked for it: the note keyed at the till ("Medium", "No
+      // cheese", "Sauce on the side") and the modifiers picked with it. Neither
+      // ever reaches MEWS, so the app is the only place they can be kept. Sent
+      // raw — the app splits the free text from the modifier echo the POS mixes
+      // into the same field.
+      note: it.item_notes || null,
+      modifiers: Array.isArray(it.modifiers_array) ? it.modifiers_array : [],
     })),
   };
   try {
