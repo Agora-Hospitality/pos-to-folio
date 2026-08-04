@@ -14,6 +14,7 @@ const { init, startPolling, stopPolling, pollOnce, getRoomMap, getResourceToRoom
 const { handleReservationUpdate, fullSync } = require('./roster');
 const { post: mewsPost } = require('./mews');
 const { ping: goodtillPing } = require('./goodtill');
+const { registerResdiaryRoutes } = require('./resdiary-sync');
 
 const app = express();
 app.use(express.json());
@@ -163,9 +164,21 @@ app.post('/webhooks/goodtill', async (req, res) => {
   }
 });
 
+// ─── ResDiary worker (dormant until RESDIARY_* env is set) ───────────
+// Additive: /resdiary/status·whoami·backfill·reconcile. The whitelisted
+// static-IP egress of THIS service is why outbound ResDiary lives here.
+
+registerResdiaryRoutes(app);
+
 // ─── Startup ──────────────────────────────────────────────────────────
 
 let resyncTimer = null;
+
+// RESDIARY_ROUTES_ONLY=1 boots ONLY the HTTP surface — no MEWS/Goodtill
+// init, no polling. For local QA of the ResDiary worker without touching
+// the money path (a fresh local dedup store + live polling would re-post
+// old Guest Folio sales).
+const ROUTES_ONLY = process.env.RESDIARY_ROUTES_ONLY === '1';
 
 async function start() {
   const required = [
@@ -175,7 +188,7 @@ async function start() {
     'GOODTILL_USERNAME',
     'GOODTILL_PASSWORD',
   ];
-  const missing = required.filter((k) => !process.env[k]);
+  const missing = ROUTES_ONLY ? [] : required.filter((k) => !process.env[k]);
   if (missing.length) {
     console.error(`[server] Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
@@ -190,7 +203,13 @@ async function start() {
     console.log(`[server] Manual sync:  POST http://localhost:${PORT}/sync`);
     console.log(`[server] MEWS webhook: POST http://localhost:${PORT}/webhooks/mews`);
     console.log(`[server] Goodtill webhook: POST http://localhost:${PORT}/webhooks/goodtill`);
+    console.log(`[server] ResDiary:     GET  http://localhost:${PORT}/resdiary/status (token-gated)`);
   });
+
+  if (ROUTES_ONLY) {
+    console.log('[server] RESDIARY_ROUTES_ONLY=1 — bridge init/polling SKIPPED');
+    return;
+  }
 
   // Then attempt to initialise MEWS config + roster sync (non-fatal)
   try {
