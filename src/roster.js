@@ -30,6 +30,9 @@ const MANAGED_SOURCE = 'mews-bridge';
 // Goodtill serializes the active flag inconsistently (1 vs "1" vs true)
 const isActiveFlag = (c) => c.active === 1 || c.active === '1' || c.active === true;
 
+// Bridge-managed records carry the source tag or a mews: reservation ref
+const isManaged = (c) => c.source === MANAGED_SOURCE || c.custom_field_1?.startsWith?.('mews:');
+
 /**
  * Pick the ONE record that represents a room, deterministically.
  *
@@ -110,10 +113,29 @@ async function fullSync(roomMap, resourceToRoom) {
 
   // 4. Get all existing bridge-managed customers from Goodtill
   const allGtCustomers = await listCustomers();
-  const managedCustomers = allGtCustomers.filter(
-    (c) => c.source === MANAGED_SOURCE || c.custom_field_1?.startsWith('mews:')
-  );
+  const managedCustomers = allGtCustomers.filter(isManaged);
   console.log(`[roster] Found ${managedCustomers.length} bridge-managed customers in Goodtill`);
+
+  // 4b. Sweep room impostors cloned by other integrations. The ResDiary
+  // customer sync copies the bridge's room-named records back into Goodtill
+  // as its own customers (source "ResDiary", name machine-split into
+  // first_name "DEM11" / last_name "— Kevin Anselme", no bridge tagging),
+  // so nothing ever deactivated them at checkout and they haunted room
+  // searches for weeks (FOH report 2026-08-12). Any ACTIVE unmanaged
+  // customer named after a known room is such a clone — the room's real
+  // record is always bridge-managed. Folio sales assigned to a clone only
+  // reach MEWS via the customer-NAME fallback, so hiding clones steers
+  // waiters to the record that posts reliably.
+  const knownRooms = new Set(roomMap.keys());
+  const impostors = allGtCustomers.filter((c) => {
+    if (isManaged(c) || !isActiveFlag(c)) return false;
+    const match = c.name?.match(/^(?:Room\s+)?(\S+)\s*—/i);
+    return match != null && knownRooms.has(match[1]);
+  });
+  for (const ghost of impostors) {
+    console.log(`[roster] Deactivating room impostor "${ghost.name}" (source=${ghost.source || 'unknown'}, ${ghost.id})`);
+    await deactivateCustomer(ghost.id);
+  }
 
   // Group by room code, then choose ONE record per room (see chooseRoomRecord —
   // response order rotates, so the choice must not depend on it)
