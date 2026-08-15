@@ -170,6 +170,28 @@ test('string "1" active flags are treated as active (no needless reactivation wr
   assert.equal(calls.deactivate.length, 0);
 });
 
+test('room impostors from other integrations: active unmanaged record named after a known room is deactivated', async () => {
+  mewsReservations = [reservation('res-A')];
+  mewsGuests = [{ Id: 'guest-1', FirstName: 'Nataliya', LastName: 'Jungi' }];
+  gtCustomers = [
+    // cloned back by the ResDiary customer sync — foreign source, no mews ref
+    { id: 'ghost-1', name: 'DEM11 — Kevin Anselme', active: 1, custom_field_1: null, source: 'ResDiary', updated_at: '2026-08-15 07:51:36' },
+    // real CRM customer, not room-named — must never be touched
+    { id: 'crm-1', name: 'Kevin Anselme', active: 1, custom_field_1: null, source: null, updated_at: '2026-08-15 07:52:00' },
+    // room-named but already inactive — invisible, leave alone
+    { id: 'ghost-2', name: 'DEM11 — Steve Birchall', active: 0, custom_field_1: null, source: null, updated_at: '2026-07-26 05:11:04' },
+    // named after a room MEWS doesn't know — could be anything, leave alone
+    { id: 'odd-1', name: 'ZZZ99 — Mystery', active: 1, custom_field_1: null, source: null, updated_at: '2026-08-01 10:00:00' },
+    gtRecord('cur-1', 'DEM11 — Nataliya Jungi', { active: 1, ref: 'mews:res-A', updated: '2026-08-15 18:57:01' }),
+  ];
+
+  await fullSync(roomMap, resourceToRoom);
+
+  assert.deepEqual(calls.deactivate, ['ghost-1']);
+  assert.equal(calls.update.length, 0);
+  assert.equal(roomCustomerMap.get('DEM11'), 'cur-1');
+});
+
 test('occupied room with no record at all: creates exactly one', async () => {
   mewsReservations = [reservation('res-A')];
   mewsGuests = [{ Id: 'guest-1', FirstName: 'Nataliya', LastName: 'Jungi' }];
