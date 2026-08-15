@@ -27,6 +27,36 @@ const {
 const CUSTOMER_PREFIX = 'Room ';
 const MANAGED_SOURCE = 'mews-bridge';
 
+// Goodtill serializes the active flag inconsistently (1 vs "1" vs true)
+const isActiveFlag = (c) => c.active === 1 || c.active === '1' || c.active === true;
+
+/**
+ * Pick the ONE record that represents a room, deterministically.
+ *
+ * Never pick by response order: Goodtill returns /customers sorted by
+ * updated_at ascending, so "first match wins" selects the STALEST record and
+ * rotates the chosen identity every sync — renaming ancient records to the
+ * current guest, flip-flopping active flags (~2 writes per room per sync),
+ * and littering the POS iPad's cached customer list with past guests.
+ *
+ * Preference: record already stamped with the room's current reservation
+ * (active first), then the currently-active record, then the most recently
+ * updated. Steady state re-chooses the same record and writes nothing.
+ *
+ * @param {any[]} records - all bridge-managed Goodtill customers for a room
+ * @param {string|null} mewsRef - "mews:<reservationId>" of the current stay
+ */
+function chooseRoomRecord(records, mewsRef) {
+  const latest = (a, b) => ((a.updated_at || '') >= (b.updated_at || '') ? a : b);
+  const refMatches = mewsRef ? records.filter((c) => c.custom_field_1 === mewsRef) : [];
+  const activeRefMatches = refMatches.filter(isActiveFlag);
+  if (activeRefMatches.length) return activeRefMatches.reduce(latest);
+  if (refMatches.length) return refMatches.reduce(latest);
+  const actives = records.filter(isActiveFlag);
+  if (actives.length) return actives.reduce(latest);
+  return records.reduce(latest);
+}
+
 /**
  * In-memory map of room number → Goodtill customer ID
  * @type {Map<string, string>}
@@ -85,26 +115,32 @@ async function fullSync(roomMap, resourceToRoom) {
   );
   console.log(`[roster] Found ${managedCustomers.length} bridge-managed customers in Goodtill`);
 
-  // Build lookup by room code — and deduplicate (delete extras from previous buggy syncs)
-  const gtByRoom = new Map();
-  const duplicates = [];
+  // Group by room code, then choose ONE record per room (see chooseRoomRecord —
+  // response order rotates, so the choice must not depend on it)
+  const recordsByRoom = new Map();
   for (const c of managedCustomers) {
     const match = c.name?.match(/^(?:Room\s+)?(\S+)\s*—/i);
     if (match) {
       const room = match[1];
-      if (gtByRoom.has(room)) {
-        // Keep the one already in the map, queue this one for deletion
-        duplicates.push(c);
-      } else {
-        gtByRoom.set(room, c);
-      }
+      if (!recordsByRoom.has(room)) recordsByRoom.set(room, []);
+      recordsByRoom.get(room).push(c);
+    }
+  }
+  const gtByRoom = new Map();
+  const duplicates = [];
+  for (const [room, records] of recordsByRoom) {
+    const currentRes = occupiedRooms.get(room)?.reservation;
+    const chosen = chooseRoomRecord(records, currentRes ? `mews:${currentRes.Id}` : null);
+    gtByRoom.set(room, chosen);
+    for (const c of records) {
+      if (c !== chosen) duplicates.push(c);
     }
   }
   // Only deactivate duplicates that are still active. Historical checked-out
   // customers are already inactive — re-deactivating them on every sync makes
   // thousands of pointless API calls and can stall the sync before steps 5/6
   // run (so current guests never get pushed to Goodtill).
-  const toDeactivate = duplicates.filter((c) => c.active === 1 || c.active === true);
+  const toDeactivate = duplicates.filter(isActiveFlag);
   if (toDeactivate.length) {
     console.log(`[roster] Cleaning up ${toDeactivate.length} duplicate customers (${duplicates.length - toDeactivate.length} already inactive, skipped)...`);
     for (const dup of toDeactivate) {
@@ -121,8 +157,11 @@ async function fullSync(roomMap, resourceToRoom) {
 
     const existing = gtByRoom.get(roomNumber);
     if (existing) {
-      // Update name/activation if needed
-      const needsUpdate = existing.name !== displayName || existing.active !== 1;
+      // Update name/activation/reservation ref if needed
+      const needsUpdate =
+        existing.name !== displayName ||
+        !isActiveFlag(existing) ||
+        existing.custom_field_1 !== mewsRef;
       if (needsUpdate) {
         console.log(`[roster] Updating customer for room ${roomNumber}: "${displayName}"`);
         await updateCustomer(existing.id, {
@@ -153,7 +192,7 @@ async function fullSync(roomMap, resourceToRoom) {
 
   // 6. Deactivate customers for rooms no longer occupied
   for (const [roomNumber, c] of gtByRoom) {
-    if (c.active === 1 || c.active === true) {
+    if (isActiveFlag(c)) {
       console.log(`[roster] Deactivating customer for room ${roomNumber} (checked out)`);
       await deactivateCustomer(c.id);
     }
