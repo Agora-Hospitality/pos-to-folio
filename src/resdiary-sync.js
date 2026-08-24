@@ -307,6 +307,15 @@ function authorized(req) {
   return false;
 }
 
+/** The addresses sent to ResDiary for whitelisting on 04-08-2026, never
+ *  acknowledged. Kept in code so /resdiary/egress can say whether what leaves
+ *  today is still what they were asked to allow. */
+const WHITELIST_SENT = ['162.220.232.250', '152.55.176.240', '162.220.232.252'];
+
+// A plain browser-ish agent for the IP echoes — the ResDiary one names an
+// integration and has no business in another service's logs.
+const USER_AGENT_FOR_PROBE = 'AgoraPosToFolio/1.0 (egress-check)';
+
 function getStatus() {
   return {
     configured: {
@@ -315,6 +324,7 @@ function getStatus() {
       ingestToken: ingestConfigured(),
       appUrl: appTarget().url,
     },
+    micrositeName: process.env.RESDIARY_MICROSITE_NAME || null,
     tokenCached: rd.hasCreds() ? rd.tokenCached() : false,
     cursor: readCursor(),
     sync: { ...state },
@@ -326,6 +336,46 @@ function registerResdiaryRoutes(app) {
   app.get('/resdiary/status', (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     res.json(getStatus());
+  });
+
+  /**
+   * What IP address ResDiary actually sees when this service calls out.
+   *
+   * The whitelist request named three addresses and was never acknowledged, so
+   * two things are unknown at once: whether ResDiary added them, and whether
+   * they are still OUR addresses. A platform can rotate egress without saying
+   * so, and then a whitelist that was set up correctly points at nothing.
+   *
+   * This separates those. Run it, compare with what was sent, and the answer is
+   * either "they never added it" or "they added the wrong thing" — which need
+   * very different emails.
+   */
+  app.get('/resdiary/egress', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    // Two independent echoes: one of them being down must not read as an
+    // answer, and two agreeing is worth more than one asserting.
+    const probes = ['https://api.ipify.org?format=json', 'https://ifconfig.co/json'];
+    const seen = [];
+    for (const url of probes) {
+      try {
+        const r = await fetch(url, { headers: { 'User-Agent': USER_AGENT_FOR_PROBE }, signal: AbortSignal.timeout(10_000) });
+        const j = await r.json();
+        const ip = j.ip || j.address || null;
+        if (ip) seen.push({ via: new URL(url).host, ip });
+      } catch (err) {
+        seen.push({ via: new URL(url).host, error: err.message });
+      }
+    }
+    const ips = [...new Set(seen.map((s) => s.ip).filter(Boolean))];
+    res.json({
+      egressIps: ips,
+      probes: seen,
+      whitelistRequested: WHITELIST_SENT,
+      // Only ever a hint — one request leaves through one of a pool, so a
+      // mismatch on a single call is not proof the pool changed.
+      matchesRequested: ips.length ? ips.every((ip) => WHITELIST_SENT.includes(ip)) : null,
+      note: 'One call leaves via one address. Run it a few times to see the whole pool.',
+    });
   });
 
   // Discovery: CurrentUser + Restaurants — run this the moment ResDiary
