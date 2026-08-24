@@ -343,6 +343,44 @@ function registerResdiaryRoutes(app) {
     }
   });
 
+  /**
+   * Diner reviews → the app.
+   *
+   * `?raw=1` returns ResDiary's payload untouched and writes nothing. That is
+   * the FIRST call to make once the whitelist lands: the Reviews response shape
+   * is not in the portal docs we hold, and seeing one real response is worth
+   * more than any amount of guessing. The mapping then lives app-side, where it
+   * can be corrected without redeploying this worker.
+   */
+  app.get('/resdiary/reviews', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+    try {
+      const payload = await rd.getReviews({ fromDate: req.query.from, toDate: req.query.to });
+      if (req.query.raw === '1') return res.json({ ok: true, payload });
+
+      const { url, token } = appTarget();
+      if (!token) return res.status(503).json({ error: 'RESDIARY_INGEST_TOKEN not set' });
+      const push = await fetch(url.replace(/\/ingest$/, '/reviews'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ payload }),
+        signal: AbortSignal.timeout(120_000),
+      });
+      const body = await push.text();
+      if (!push.ok) return res.status(502).json({ error: `app ingest HTTP ${push.status}`, detail: body.slice(0, 300) });
+      res.json({ ok: true, app: JSON.parse(body) });
+    } catch (err) {
+      // A Cloudflare block here means one thing and one thing only: this
+      // service's egress IP is not on ResDiary's allowlist yet.
+      const blocked = err instanceof rd.CloudflareBlockedError;
+      res.status(blocked ? 502 : 500).json({
+        error: err.message,
+        ...(blocked ? { hint: 'This egress IP is not whitelisted by ResDiary — send them the Railway static IPs.' } : {}),
+      });
+    }
+  });
+
   app.post('/resdiary/backfill', (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.isConfigured() || !ingestConfigured()) {

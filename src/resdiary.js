@@ -250,6 +250,40 @@ async function getRestaurants() {
   return rdGet('/api/ConsumerApi/v1/Restaurants');
 }
 
+/**
+ * The diner reviews ResDiary holds for one microsite.
+ *
+ * ── Why this is a different shape to everything else here ──────────────────
+ * Reviews live on the CONSUMER API, which is keyed on `micrositeName` — not on
+ * the {deploymentId}/{providerId} pair Data Extract uses. That is genuinely
+ * good news: the microsite name rides free on every webhook notification and is
+ * printed in the diary's own settings, whereas the Data Extract ids can only be
+ * discovered through a call that the IP whitelist blocks. So reviews need one
+ * value we can already get without ResDiary's help.
+ *
+ * ── Why we need it at all ──────────────────────────────────────────────────
+ * ResDiary emails the venue a daily feedback digest, and that digest carries no
+ * per-review score — its only number is the batch average, which cannot be
+ * spread across the reviews without inventing scores nobody gave. The score is
+ * the point, so it has to come from here.
+ *
+ * The response shape is NOT in the portal docs we have read, so the caller gets
+ * the payload verbatim and normalises it. Guessing a schema here would bake a
+ * wrong assumption into the one place that is hard to see into.
+ */
+async function getReviews({ micrositeName, fromDate, toDate } = {}) {
+  const site = micrositeName || process.env.RESDIARY_MICROSITE_NAME || '';
+  if (!site) {
+    throw new Error(
+      'RESDIARY_MICROSITE_NAME not set — read it from Diary → Settings → Alter Restaurant Details, ' +
+      'or from any webhook payload (MicrositeName), or via /resdiary/whoami once data calls work',
+    );
+  }
+  return rdGet(`/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Reviews`, {
+    query: { fromDate, toDate },
+  });
+}
+
 function dePath(rest) {
   const i = ids();
   if (!i.deploymentId || !i.providerId) {
@@ -305,6 +339,7 @@ module.exports = {
   getToken,
   getCurrentUser,
   getRestaurants,
+  getReviews,
   getEarliestBookingDate,
   getBookingsForDate,
   getBookingById,
