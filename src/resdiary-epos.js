@@ -245,6 +245,37 @@ function buildReceiptXml(items) {
   return `<Receipt>\n  <Items>\n${rows}\n  </Items>\n</Receipt>`;
 }
 
+/**
+ * Hunt a usable table id anywhere in a restaurant-setup/diary response:
+ * the first entry of any non-empty `Tables` array (numbers, or objects with
+ * an Id). Sandbox bookings require at least one table.
+ */
+function findFirstTableId(node, depth = 0) {
+  if (!node || typeof node !== 'object' || depth > 8) return null;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const hit = findFirstTableId(item, depth + 1);
+      if (hit !== null) return hit;
+    }
+    return null;
+  }
+  for (const [k, v] of Object.entries(node)) {
+    if (k === 'Tables' && Array.isArray(v) && v.length) {
+      const first = v[0];
+      if (typeof first === 'number') return first;
+      if (first && typeof first === 'object') {
+        const id = first.Id ?? first.TableId;
+        if (id !== undefined && id !== null) return id;
+      }
+    }
+  }
+  for (const v of Object.values(node)) {
+    const hit = findFirstTableId(v, depth + 1);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
 // ── Demo: the exact flow Access wants to see before releasing prod ──
 
 /**
@@ -254,7 +285,7 @@ function buildReceiptXml(items) {
  * `receipt` ({items:[{description,quantity,price}]} or raw `receiptXml`)
  * override the defaults so shapes are iterated with curl, not redeploys.
  */
-async function runEposDemo({ date, bookingId, covers = 2, booking, receipt, receiptXml } = {}) {
+async function runEposDemo({ date, bookingId, covers = 2, booking, receipt, receiptXml, tableId } = {}) {
   const c = cfg();
   const day = date || new Date().toISOString().slice(0, 10);
   const steps = [];
@@ -282,6 +313,16 @@ async function runEposDemo({ date, bookingId, covers = 2, booking, receipt, rece
 
   let targetId = bookingId ?? null;
   if (!targetId) {
+    // Sandbox validation: "At least one table must be specified" — discover
+    // one from the restaurant setup unless the caller named it.
+    let table = tableId ?? null;
+    if (!table && !booking) {
+      const setup = await step('restaurantSetup', () => eposFetch('GET', `/Restaurant/${c.restaurantId}`));
+      table = findFirstTableId(setup?.body);
+      if (!table) return { ok: false, steps, note: 'no table id found in the Restaurant setup — pass {"tableId": N} and re-run' };
+      steps.push({ name: 'tableDiscovery', ok: true, status: null, body: `using table ${table}` });
+    }
+
     const visitMs = Date.parse(`${day}T19:00:00Z`);
     const defaults = {
       VisitDateTime: dotNetDate(visitMs),
@@ -303,7 +344,7 @@ async function runEposDemo({ date, bookingId, covers = 2, booking, receipt, rece
       Promotions: [],
       Payments: [],
       Extras: [],
-      Tables: [],
+      Tables: table ? [table] : [],
     };
     const created = await step('createBooking', () =>
       eposFetch('POST', `/Restaurant/${c.restaurantId}/Booking?overrideCovers=true`, { json: booking || defaults })
@@ -374,5 +415,5 @@ module.exports = {
   runEposDemo,
   registerEposRoutes,
   // exported for tests
-  _internal: { pct, baseString, hmacSign, parseTokenResponse, oauthBase, splitUrl, buildOAuthHeader, dotNetDate, buildReceiptXml },
+  _internal: { pct, baseString, hmacSign, parseTokenResponse, oauthBase, splitUrl, buildOAuthHeader, dotNetDate, buildReceiptXml, findFirstTableId },
 };

@@ -76,6 +76,14 @@ test('dotNetDate and receipt XML match the Postman collection shapes', () => {
   assert.ok(xml.trim().endsWith('</Receipt>'));
 });
 
+test('findFirstTableId digs table ids out of nested setup responses', () => {
+  assert.strictEqual(e.findFirstTableId({ Areas: [{ Name: 'Main', Tables: [{ Id: 436766, Name: 'T1' }] }] }), 436766);
+  assert.strictEqual(e.findFirstTableId({ Setup: { Rooms: [{ Tables: [12, 13] }] } }), 12);
+  assert.strictEqual(e.findFirstTableId({ Tables: [] }), null);
+  assert.strictEqual(e.findFirstTableId({ Nothing: true }), null);
+  assert.strictEqual(e.findFirstTableId([{ Tables: [{ TableId: 9 }] }]), 9);
+});
+
 test('oauthBase carries the five required params with fresh nonces', () => {
   const a = e.oauthBase('k');
   const b = e.oauthBase('k');
