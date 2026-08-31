@@ -48,6 +48,34 @@ test('parseTokenResponse reads form-encoded and JSON shapes', () => {
   assert.strictEqual(e.parseTokenResponse('nonsense').token, null);
 });
 
+test('buildOAuthHeader signs query params and keeps them out of the header', () => {
+  const h = e.buildOAuthHeader('POST', 'https://app.rdbranch.com/OAuth/V10a?second_secret=SS&scope=http://x/y', {
+    consumerKey: 'ck',
+    consumerSecret: 'cs',
+  });
+  assert.ok(h.startsWith('OAuth '));
+  assert.ok(h.includes('oauth_consumer_key="ck"'));
+  assert.ok(h.includes('oauth_signature="'));
+  assert.ok(!h.includes('second_secret')); // query params are signed, never carried in the header
+  assert.ok(!h.includes('scope='));
+});
+
+test('splitUrl separates bare url from query for the signature base', () => {
+  const { bareUrl, query } = e.splitUrl('https://h/x/y?b=2&a=1');
+  assert.strictEqual(bareUrl, 'https://h/x/y');
+  assert.deepStrictEqual(query, { b: '2', a: '1' });
+});
+
+test('dotNetDate and receipt XML match the Postman collection shapes', () => {
+  assert.strictEqual(e.dotNetDate(1513247400000), '/Date(1513247400000)/');
+  const xml = e.buildReceiptXml([{ description: 'Fish & chips', quantity: 1, price: 10.99 }]);
+  assert.ok(xml.startsWith('<Receipt>'));
+  assert.ok(xml.includes('<Description>Fish &amp; chips</Description>'));
+  assert.ok(xml.includes('<Quantity>1</Quantity>'));
+  assert.ok(xml.includes('<Price>10.99</Price>'));
+  assert.ok(xml.trim().endsWith('</Receipt>'));
+});
+
 test('oauthBase carries the five required params with fresh nonces', () => {
   const a = e.oauthBase('k');
   const b = e.oauthBase('k');

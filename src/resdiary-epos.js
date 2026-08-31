@@ -1,32 +1,47 @@
 /**
- * ResDiary EPOS API client — 2-legged OAuth 1.0a (per the EPOS docs in the
- * API portal: Deployments table gives per-region OAuth + API hosts; requests
- * need consumer key/secret, the per-restaurant SECOND SECRET, and a scope).
+ * ResDiary EPOS API client — 2-legged OAuth 1.0a.
  *
- * Purpose: push till receipts onto ResDiary bookings — the only way the
- * booking's spend field is ever populated — plus diary reads. Access released
- * sandbox EPOS credentials on 31-08-2026; the PRODUCTION Second Secret is
- * handed over only after we demonstrate receipts posting successfully in
- * sandbox. `runEposDemo()` below IS that demonstration, end to end.
+ * Shapes verified against ResDiary's own Postman collection
+ * (/Content/postman/ResDiary-EPOS-API-v1.postman_collection.json — served
+ * unauthenticated from the portal, fetched 31-08-2026). The facts that bit:
  *
- * Payload shapes for Create Booking / Receipt are not in the docs we hold, so
- * the demo accepts overrides and returns every vendor response VERBATIM —
- * iterate against sandbox with one curl, no redeploys.
+ *   · OAuth params travel in the AUTHORIZATION HEADER (addParamsToHeader),
+ *     never the body. A form-encoded body POST to /OAuth/V10a is answered
+ *     with a redirect to an HTML error page — which fetch() follows, so the
+ *     failure surfaces as "200 with HTML" unless redirects are refused.
+ *   · Request token: POST {oauthUrl}?second_secret=..&scope=.. — the TWO
+ *     QUERY params are part of the signature base. Access token: POST the
+ *     bare oauthUrl with oauth_token from step 1, signed with its secret.
+ *   · scope is the constant http://app.restaurantdiary.com/WebServices/Epos/v1
+ *     (same across environments — restaurantdiary.com, not resdiary.com).
+ *   · Token responses are form-encoded: oauth_token=..&oauth_token_secret=..
+ *   · DiaryData / BookingChanges take ?date= QUERY params (signed!), not
+ *     path segments.
+ *   · Add Booking is JSON with .NET dates ("/Date(1513247400000)/"), field
+ *     `Covers` (not PartySize), Type "Internal", nested Customer; response
+ *     carries BookingId + Customer.CustomerId.
+ *   · Add Receipt is XML: <Receipt><Items><Item><Description/><Quantity/>
+ *     <Price/></Item>…</Items></Receipt>.
  *
- * Everything is DORMANT until the RESDIARY_EPOS_* env is set.
+ * Purpose: push till receipts onto bookings — the only way booking spend is
+ * ever populated. Access released sandbox credentials 31-08-2026; production
+ * Second Secret follows a successful sandbox receipt demo, which is exactly
+ * what runEposDemo() performs. Dormant until RESDIARY_EPOS_* env is set.
  */
 
 const crypto = require('node:crypto');
 
+const DEFAULT_SCOPE = 'http://app.restaurantdiary.com/WebServices/Epos/v1';
+
 function cfg() {
   return {
-    oauthUrl: process.env.RESDIARY_EPOS_OAUTH_URL || '', // e.g. https://uk.resdiary.com/OAuth/V10a
-    apiUrl: (process.env.RESDIARY_EPOS_API_URL || '').replace(/\/$/, ''), // e.g. https://uk.resdiary.com/WebServices/Epos/v1
+    oauthUrl: process.env.RESDIARY_EPOS_OAUTH_URL || '', // e.g. https://app.rdbranch.com/OAuth/V10a
+    apiUrl: (process.env.RESDIARY_EPOS_API_URL || '').replace(/\/$/, ''), // e.g. https://app.rdbranch.com/WebServices/Epos/v1
     consumerKey: process.env.RESDIARY_EPOS_CONSUMER_KEY || '',
     consumerSecret: process.env.RESDIARY_EPOS_CONSUMER_SECRET || '',
     secondSecret: process.env.RESDIARY_EPOS_SECOND_SECRET || '',
     restaurantId: process.env.RESDIARY_EPOS_RESTAURANT_ID || '',
-    scope: process.env.RESDIARY_EPOS_SCOPE || 'http://rd.resdiary.com/api/epos',
+    scope: process.env.RESDIARY_EPOS_SCOPE || DEFAULT_SCOPE,
   };
 }
 
@@ -42,7 +57,7 @@ function pct(v) {
   return encodeURIComponent(String(v)).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 }
 
-/** The signature base string: METHOD & enc(url) & enc(sorted params). */
+/** The signature base string: METHOD & enc(bare url) & enc(sorted params). */
 function baseString(method, url, params) {
   const pairs = Object.entries(params)
     .map(([k, v]) => [pct(k), pct(v)])
@@ -66,7 +81,34 @@ function oauthBase(consumerKey) {
   };
 }
 
-/** Token responses are classically form-encoded; tolerate JSON too. */
+/** Split a URL into its bare form and query params (both signed under OAuth1). */
+function splitUrl(fullUrl) {
+  const u = new URL(fullUrl);
+  const query = {};
+  for (const [k, v] of u.searchParams.entries()) query[k] = v;
+  u.search = '';
+  return { bareUrl: u.toString(), query };
+}
+
+/**
+ * Sign a request and return the Authorization header. Query params are part
+ * of the signature base; oauth_* params travel ONLY in the header.
+ */
+function buildOAuthHeader(method, fullUrl, { consumerKey, consumerSecret, token, tokenSecret }) {
+  const { bareUrl, query } = splitUrl(fullUrl);
+  const oauth = { ...oauthBase(consumerKey) };
+  if (token) oauth.oauth_token = token;
+  const base = baseString(method, bareUrl, { ...query, ...oauth });
+  oauth.oauth_signature = hmacSign(base, consumerSecret, tokenSecret || '');
+  const header =
+    'OAuth ' +
+    Object.entries(oauth)
+      .map(([k, v]) => `${pct(k)}="${pct(v)}"`)
+      .join(', ');
+  return header;
+}
+
+/** Token responses are form-encoded; tolerate JSON too. */
 function parseTokenResponse(text) {
   const t = String(text).trim();
   if (t.startsWith('{')) {
@@ -81,24 +123,28 @@ function parseTokenResponse(text) {
   return { token: p.get('oauth_token'), secret: p.get('oauth_token_secret'), raw: t };
 }
 
-async function oauthTokenCall(url, params, consumerSecret, tokenSecret = '') {
-  const signed = { ...params, oauth_signature: hmacSign(baseString('POST', url, params), consumerSecret, tokenSecret) };
-  const body = new URLSearchParams(signed).toString();
-  const res = await fetch(url, {
+async function oauthTokenCall(fullUrl, creds) {
+  const header = buildOAuthHeader('POST', fullUrl, creds);
+  // redirect:"manual" — a rejected OAuth call answers with a redirect to an
+  // HTML error page; following it turns the real failure into "200 + HTML".
+  const res = await fetch(fullUrl, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
+    headers: { Authorization: header, 'Content-Length': '0' },
+    redirect: 'manual',
     signal: AbortSignal.timeout(30_000),
   });
   const text = await res.text();
-  if (!res.ok) throw new Error(`OAuth ${url} HTTP ${res.status}: ${text.slice(0, 300)}`);
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error(`OAuth rejected (redirect ${res.status} → ${res.headers.get('location') || '?'}) — check consumer key/secret, second_secret and scope`);
+  }
+  if (!res.ok) throw new Error(`OAuth HTTP ${res.status}: ${text.slice(0, 300)}`);
   const parsed = parseTokenResponse(text);
-  if (!parsed.token) throw new Error(`OAuth ${url}: no oauth_token in response: ${text.slice(0, 200)}`);
+  if (!parsed.token) throw new Error(`OAuth: no oauth_token in response: ${text.slice(0, 200)}`);
   return parsed;
 }
 
-// Access token cached per process; EPOS token lifetime is undocumented, so a
-// 401 on an API call clears it and the next call re-runs the dance.
+// Access token cached per process; lifetime is undocumented, so a 401 on an
+// API call clears it and the next call re-runs the dance.
 let _access = null;
 
 async function getAccessToken(force = false) {
@@ -106,71 +152,109 @@ async function getAccessToken(force = false) {
   const c = cfg();
   if (!eposConfigured()) throw new Error('EPOS not configured (RESDIARY_EPOS_* env)');
 
-  const request = await oauthTokenCall(
-    c.oauthUrl,
-    { ...oauthBase(c.consumerKey), second_secret: c.secondSecret, scope: c.scope },
-    c.consumerSecret
-  );
-  const access = await oauthTokenCall(
-    c.oauthUrl,
-    { ...oauthBase(c.consumerKey), oauth_token: request.token, second_secret: c.secondSecret, scope: c.scope },
-    c.consumerSecret,
-    request.secret || ''
-  );
+  // Step 1 — request token: second_secret + scope as SIGNED query params.
+  const requestUrl = `${c.oauthUrl}?second_secret=${pct(c.secondSecret)}&scope=${pct(c.scope)}`;
+  const request = await oauthTokenCall(requestUrl, {
+    consumerKey: c.consumerKey,
+    consumerSecret: c.consumerSecret,
+  });
+
+  // Step 2 — exchange for the access token, signed with the request secret.
+  const access = await oauthTokenCall(c.oauthUrl, {
+    consumerKey: c.consumerKey,
+    consumerSecret: c.consumerSecret,
+    token: request.token,
+    tokenSecret: request.secret || '',
+  });
   _access = access;
   return _access;
 }
 
-/** Signed EPOS API request. JSON in/out; OAuth params travel in the header. */
-async function eposFetch(method, apiPath, jsonBody) {
+/**
+ * Signed EPOS API request. `body` is {json} OR {xml}; query params on the
+ * path are signed automatically. Returns {status, ok, body} with the vendor
+ * response verbatim (JSON-parsed when possible).
+ */
+async function eposFetch(method, apiPath, body) {
   const c = cfg();
   const token = await getAccessToken();
   const url = `${c.apiUrl}${apiPath}`;
 
   const attempt = async (tok) => {
-    const params = { ...oauthBase(c.consumerKey), oauth_token: tok.token };
-    params.oauth_signature = hmacSign(baseString(method, url, params), c.consumerSecret, tok.secret || '');
-    const header =
-      'OAuth ' +
-      Object.entries(params)
-        .map(([k, v]) => `${pct(k)}="${pct(v)}"`)
-        .join(', ');
+    const header = buildOAuthHeader(method, url, {
+      consumerKey: c.consumerKey,
+      consumerSecret: c.consumerSecret,
+      token: tok.token,
+      tokenSecret: tok.secret || '',
+    });
+    const headers = { Authorization: header, Accept: 'application/json' };
+    let payload;
+    if (body?.json !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      payload = JSON.stringify(body.json);
+    } else if (body?.xml !== undefined) {
+      headers['Content-Type'] = 'application/xml';
+      payload = body.xml;
+    }
     const res = await fetch(url, {
       method,
-      headers: {
-        Authorization: header,
-        Accept: 'application/json',
-        ...(jsonBody !== undefined ? { 'Content-Type': 'application/json' } : {}),
-      },
-      body: jsonBody !== undefined ? JSON.stringify(jsonBody) : undefined,
+      headers,
+      body: payload,
+      redirect: 'manual',
       signal: AbortSignal.timeout(60_000),
     });
     const text = await res.text();
-    let body;
+    let parsed;
     try {
-      body = text ? JSON.parse(text) : null;
+      parsed = text ? JSON.parse(text) : null;
     } catch {
-      body = text;
+      parsed = text.slice(0, 500);
     }
-    return { status: res.status, ok: res.ok, body };
+    const redirected = res.status >= 300 && res.status < 400;
+    return {
+      status: res.status,
+      ok: res.ok,
+      body: redirected ? `redirect → ${res.headers.get('location') || '?'} (auth rejected?)` : parsed,
+    };
   };
 
   let out = await attempt(token);
-  if (out.status === 401) {
+  if (out.status === 401 || out.status === 302) {
     out = await attempt(await getAccessToken(true)); // stale token — one re-dance
   }
   return out;
 }
 
+// ── Demo helpers ─────────────────────────────────────────────────────
+
+/** .NET JSON date: "/Date(ms)/" — what Add Booking expects. */
+function dotNetDate(ms) {
+  return `/Date(${ms})/`;
+}
+
+const xmlEsc = (s) => String(s).replace(/[<>&'"]/g, (ch) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[ch]));
+
+/** [{description, quantity, price}] → the Receipt XML the API expects. */
+function buildReceiptXml(items) {
+  const rows = items
+    .map(
+      (i) =>
+        `    <Item>\n      <Description>${xmlEsc(i.description)}</Description>\n      <Quantity>${Number(i.quantity) || 1}</Quantity>\n      <Price>${Number(i.price).toFixed(2)}</Price>\n    </Item>`
+    )
+    .join('\n');
+  return `<Receipt>\n  <Items>\n${rows}\n  </Items>\n</Receipt>`;
+}
+
 // ── Demo: the exact flow Access wants to see before releasing prod ──
 
 /**
- * End-to-end sandbox proof: token dance → read today's diary → create a
- * booking (unless `bookingId` is supplied) → push a receipt onto it → read it
- * back. Returns a step-by-step transcript with every vendor response, so a
- * failing shape is fixed by re-running with `booking`/`receipt` overrides.
+ * End-to-end sandbox proof: token dance → read the diary → create a booking
+ * (unless `bookingId` is supplied) → push a receipt onto it → read it back.
+ * Every vendor response is returned verbatim; `booking` (JSON object) and
+ * `receipt` ({items:[{description,quantity,price}]} or raw `receiptXml`)
+ * override the defaults so shapes are iterated with curl, not redeploys.
  */
-async function runEposDemo({ date, bookingId, covers = 2, booking, receipt } = {}) {
+async function runEposDemo({ date, bookingId, covers = 2, booking, receipt, receiptXml } = {}) {
   const c = cfg();
   const day = date || new Date().toISOString().slice(0, 10);
   const steps = [];
@@ -188,37 +272,55 @@ async function runEposDemo({ date, bookingId, covers = 2, booking, receipt } = {
 
   const tok = await step('oauth', async () => {
     await getAccessToken(true);
-    return { ok: true, status: 200, body: 'request+access token dance completed' };
+    return { ok: true, status: 200, body: 'request + access token dance completed' };
   });
   if (!tok) return { ok: false, steps };
 
-  await step('diaryData', () => eposFetch('GET', `/Restaurant/${c.restaurantId}/DiaryData/${day}`));
+  await step('diaryData', () =>
+    eposFetch('GET', `/Restaurant/${c.restaurantId}/DiaryData?date=${day}&includeUnallocatedBookings=true`)
+  );
 
   let targetId = bookingId ?? null;
   if (!targetId) {
+    const visitMs = Date.parse(`${day}T19:00:00Z`);
     const defaults = {
-      VisitDate: day,
-      VisitTime: '19:00:00',
-      PartySize: covers,
-      Customer: { FirstName: 'Agora', Surname: 'EposDemo', Email: 'epos-demo@theagorahotel.com' },
+      VisitDateTime: dotNetDate(visitMs),
+      Covers: covers,
+      AreaId: 0,
+      ServiceId: 0,
+      MenuId: 0,
+      ChannelId: 0,
+      Type: 'Internal',
+      Comments: 'Agora EPOS integration demo',
+      Customer: {
+        CustomerId: 0,
+        Title: 'Mr',
+        FirstName: 'Agora',
+        Surname: 'EposDemo',
+        Email: 'epos-demo@theagorahotel.com',
+        MobileNumber: '99000000',
+      },
+      Promotions: [],
+      Payments: [],
+      Extras: [],
+      Tables: [],
     };
     const created = await step('createBooking', () =>
-      eposFetch('POST', `/Restaurant/${c.restaurantId}/Booking?overrideCovers=true`, booking || defaults)
+      eposFetch('POST', `/Restaurant/${c.restaurantId}/Booking?overrideCovers=true`, { json: booking || defaults })
     );
-    targetId = created?.body?.Id ?? created?.body?.BookingId ?? created?.body?.Booking?.Id ?? null;
-    if (!targetId) return { ok: false, steps, note: 'no booking id from createBooking — adjust the `booking` payload and re-run' };
+    targetId = created?.body?.BookingId ?? created?.body?.Id ?? null;
+    if (!targetId) return { ok: false, steps, note: 'no BookingId from createBooking — adjust the `booking` payload and re-run' };
   }
 
-  const defaultReceipt = {
-    Total: 47.5,
-    Items: [
-      { Name: 'Tasting menu', Quantity: 2, UnitPrice: 20.0 },
-      { Name: 'Wine pairing', Quantity: 1, UnitPrice: 7.5 },
-    ],
-  };
-  await step('postReceipt', () =>
-    eposFetch('POST', `/Restaurant/${c.restaurantId}/Booking/${targetId}/Receipt`, receipt || defaultReceipt)
-  );
+  const xml =
+    receiptXml ||
+    buildReceiptXml(
+      receipt?.items || [
+        { description: 'Tasting menu', quantity: 2, price: 20.0 },
+        { description: 'Wine pairing', quantity: 1, price: 7.5 },
+      ]
+    );
+  await step('postReceipt', () => eposFetch('POST', `/Restaurant/${c.restaurantId}/Booking/${targetId}/Receipt`, { xml }));
   await step('readBack', () => eposFetch('GET', `/Restaurant/${c.restaurantId}/Booking/${targetId}`));
 
   return { ok: steps.every((s) => s.ok), bookingId: targetId, steps };
@@ -272,5 +374,5 @@ module.exports = {
   runEposDemo,
   registerEposRoutes,
   // exported for tests
-  _internal: { pct, baseString, hmacSign, parseTokenResponse, oauthBase },
+  _internal: { pct, baseString, hmacSign, parseTokenResponse, oauthBase, splitUrl, buildOAuthHeader, dotNetDate, buildReceiptXml },
 };
