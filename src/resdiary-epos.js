@@ -123,24 +123,41 @@ function parseTokenResponse(text) {
   return { token: p.get('oauth_token'), secret: p.get('oauth_token_secret'), raw: t };
 }
 
+/** undici hides the network cause behind "fetch failed" — dig it out. */
+function causeOf(err) {
+  return err?.cause?.code || err?.cause?.message || err?.message || 'unknown';
+}
+
 async function oauthTokenCall(fullUrl, creds) {
-  const header = buildOAuthHeader('POST', fullUrl, creds);
-  // redirect:"manual" — a rejected OAuth call answers with a redirect to an
-  // HTML error page; following it turns the real failure into "200 + HTML".
-  const res = await fetch(fullUrl, {
-    method: 'POST',
-    headers: { Authorization: header, 'Content-Length': '0' },
-    redirect: 'manual',
-    signal: AbortSignal.timeout(30_000),
-  });
-  const text = await res.text();
-  if (res.status >= 300 && res.status < 400) {
-    throw new Error(`OAuth rejected (redirect ${res.status} → ${res.headers.get('location') || '?'}) — check consumer key/secret, second_secret and scope`);
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
+    // Fresh header per attempt — nonce/timestamp must not be reused.
+    const header = buildOAuthHeader('POST', fullUrl, creds);
+    let res, text;
+    try {
+      // redirect:"manual" — a rejected OAuth call answers with a redirect to
+      // an HTML error page; following it hides the real failure as "200+HTML".
+      res = await fetch(fullUrl, {
+        method: 'POST',
+        headers: { Authorization: header, 'Content-Length': '0' },
+        redirect: 'manual',
+        signal: AbortSignal.timeout(30_000),
+      });
+      text = await res.text();
+    } catch (err) {
+      lastErr = new Error(`OAuth network error: ${causeOf(err)} (if this recurs, boot with NODE_OPTIONS=--network-family-autoselection-attempt-timeout=10000)`);
+      continue;
+    }
+    if (res.status >= 300 && res.status < 400) {
+      throw new Error(`OAuth rejected (redirect ${res.status} → ${res.headers.get('location') || '?'}) — check consumer key/secret, second_secret and scope`);
+    }
+    if (!res.ok) throw new Error(`OAuth HTTP ${res.status}: ${text.slice(0, 300)}`);
+    const parsed = parseTokenResponse(text);
+    if (!parsed.token) throw new Error(`OAuth: no oauth_token in response: ${text.slice(0, 200)}`);
+    return parsed;
   }
-  if (!res.ok) throw new Error(`OAuth HTTP ${res.status}: ${text.slice(0, 300)}`);
-  const parsed = parseTokenResponse(text);
-  if (!parsed.token) throw new Error(`OAuth: no oauth_token in response: ${text.slice(0, 200)}`);
-  return parsed;
+  throw lastErr;
 }
 
 // Access token cached per process; lifetime is undocumented, so a 401 on an
@@ -196,13 +213,18 @@ async function eposFetch(method, apiPath, body) {
       headers['Content-Type'] = 'application/xml';
       payload = body.xml;
     }
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: payload,
-      redirect: 'manual',
-      signal: AbortSignal.timeout(60_000),
-    });
+    let res;
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: payload,
+        redirect: 'manual',
+        signal: AbortSignal.timeout(60_000),
+      });
+    } catch (err) {
+      throw new Error(`network error calling ${apiPath}: ${causeOf(err)}`);
+    }
     const text = await res.text();
     let parsed;
     try {
