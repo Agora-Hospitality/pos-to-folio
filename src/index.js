@@ -15,6 +15,7 @@ const { handleReservationUpdate, fullSync } = require('./roster');
 const { post: mewsPost } = require('./mews');
 const { ping: goodtillPing } = require('./goodtill');
 const { registerResdiaryRoutes } = require('./resdiary-sync');
+const { registerEposRoutes } = require('./resdiary-epos');
 
 const app = express();
 app.use(express.json());
@@ -169,6 +170,10 @@ app.post('/webhooks/goodtill', async (req, res) => {
 // static-IP egress of THIS service is why outbound ResDiary lives here.
 
 registerResdiaryRoutes(app);
+
+// EPOS receipt-push (sandbox demo first — Access releases the production
+// Second Secret only after /resdiary/epos-demo succeeds against sandbox).
+registerEposRoutes(app);
 
 // ─── Startup ──────────────────────────────────────────────────────────
 
