@@ -25,6 +25,12 @@ const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.resolve(process.cwd(), 'data');
 const CURSOR_FILE = path.join(DATA_DIR, 'resdiary-cursor.json');
+const RUNS_FILE = path.join(DATA_DIR, 'resdiary-runs.json');
+const MAX_RUNS = 50;
+// Seven days, not two: a booking's spend lands days after the visit (bill
+// close, late edits), and 02-09-2026 showed a 2-day window silently missing
+// everything older. Seven still costs under 10 minutes of API time.
+const DEFAULT_RECONCILE_DAYS = 7;
 
 const INGEST_CHUNK = 200; // rows per POST — well inside the app route's 300s budget
 const MAX_WALK_DAYS = 4000; // hard sanity cap (~11 years) against a bad floor date
@@ -129,6 +135,37 @@ function writeCursor(cursor) {
   }
 }
 
+// ── Run history (volume-persisted, newest first) ─────────────────────
+// The answer to "did it run, and what did it do?" without opening Railway
+// logs — surfaced in /resdiary/status and pushed to the app's health page.
+
+function readRuns() {
+  try {
+    if (fs.existsSync(RUNS_FILE)) {
+      const list = JSON.parse(fs.readFileSync(RUNS_FILE, 'utf-8'));
+      return Array.isArray(list) ? list : [];
+    }
+  } catch (err) {
+    console.warn('[resdiary-sync] runs read failed:', err.message);
+  }
+  return [];
+}
+
+/** Pure: newest first, capped. */
+function pushRun(list, run) {
+  return [run, ...(Array.isArray(list) ? list : [])].slice(0, MAX_RUNS);
+}
+
+function recordRun(run) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(RUNS_FILE, JSON.stringify(pushRun(readRuns(), run), null, 2));
+  } catch (err) {
+    console.warn('[resdiary-sync] runs write failed:', err.message);
+  }
+  postRunSummary(run).catch((err) => console.warn('[resdiary-sync] run summary push failed:', err.message));
+}
+
 // ── Push to the Agora app ────────────────────────────────────────────
 
 function appTarget() {
@@ -167,6 +204,19 @@ async function postToApp({ bookings = [], customers = [] }) {
   throw lastErr;
 }
 
+/** Best-effort: tell the app how a run went (its Settings → ResDiary page). */
+async function postRunSummary(run) {
+  const { url, token } = appTarget();
+  if (!token) return;
+  const res = await fetch(url.replace(/\/ingest$/, '/runs'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(run),
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`app runs HTTP ${res.status}`);
+}
+
 // ── Sync state (single-flight) ───────────────────────────────────────
 
 const state = {
@@ -178,7 +228,7 @@ const state = {
   counts: { days: 0, bookings: 0, customers: 0 },
 };
 
-async function runBackfill({ from, to } = {}) {
+async function runBackfill({ from, to, trigger = 'manual' } = {}) {
   if (state.running) throw new Error(`A ResDiary sync is already running (phase=${state.phase})`);
   if (!rd.isConfigured()) throw new Error('ResDiary not fully configured (creds + deployment/provider ids)');
   if (!ingestConfigured()) throw new Error('RESDIARY_INGEST_TOKEN not set');
@@ -189,6 +239,7 @@ async function runBackfill({ from, to } = {}) {
   state.finishedAt = null;
   state.lastError = null;
   state.counts = { days: 0, bookings: 0, customers: 0 };
+  const run = { kind: 'backfill', trigger, startedAt: state.startedAt, finishedAt: null, ok: false, error: null, counts: null };
 
   try {
     const cursor = readCursor() || {};
@@ -243,23 +294,28 @@ async function runBackfill({ from, to } = {}) {
 
     writeCursor({ ...cursor, floor, done: true, completedAt: new Date().toISOString() });
     console.log(`[resdiary-sync] backfill complete:`, state.counts);
+    run.ok = true;
     return { ...state.counts };
   } catch (err) {
     state.lastError = err.message;
+    run.error = err.message;
     throw err;
   } finally {
     state.running = false;
     state.phase = null;
     state.finishedAt = new Date().toISOString();
+    run.finishedAt = state.finishedAt;
+    run.counts = { ...state.counts };
+    recordRun(run);
   }
 }
 
-async function runReconcile({ days = 2 } = {}) {
+async function runReconcile({ days = DEFAULT_RECONCILE_DAYS, trigger = 'manual' } = {}) {
   if (state.running) throw new Error(`A ResDiary sync is already running (phase=${state.phase})`);
   if (!rd.isConfigured()) throw new Error('ResDiary not fully configured (creds + deployment/provider ids)');
   if (!ingestConfigured()) throw new Error('RESDIARY_INGEST_TOKEN not set');
 
-  const n = Math.min(Math.max(parseInt(days, 10) || 2, 1), 30);
+  const n = Math.min(Math.max(parseInt(days, 10) || DEFAULT_RECONCILE_DAYS, 1), 30);
   state.running = true;
   state.phase = 'reconcile';
   state.startedAt = new Date().toISOString();
@@ -267,6 +323,7 @@ async function runReconcile({ days = 2 } = {}) {
 
   const counts = { days: n, bookings: 0, customers: 0, fetched: 0, skippedStubs: 0 };
   state.counts = counts; // live progress in /resdiary/status
+  const run = { kind: 'reconcile', trigger, startedAt: state.startedAt, finishedAt: null, ok: false, error: null, counts };
   try {
     const today = toDateIso(Date.now());
     for (let i = n - 1; i >= 0; i--) {
@@ -307,14 +364,18 @@ async function runReconcile({ days = 2 } = {}) {
       }
     }
     console.log('[resdiary-sync] reconcile done:', counts);
+    run.ok = true;
     return counts;
   } catch (err) {
     state.lastError = err.message;
+    run.error = err.message;
     throw err;
   } finally {
     state.running = false;
     state.phase = null;
     state.finishedAt = new Date().toISOString();
+    run.finishedAt = state.finishedAt;
+    recordRun(run);
   }
 }
 
@@ -361,6 +422,7 @@ function getStatus() {
     tokenCached: rd.hasCreds() ? rd.tokenCached() : false,
     cursor: readCursor(),
     sync: { ...state },
+    runs: readRuns().slice(0, 20),
   };
 }
 
@@ -502,7 +564,7 @@ function registerResdiaryRoutes(app) {
     }
     if (state.running) return res.status(409).json({ error: 'sync_already_running', phase: state.phase });
     const { from, to } = req.body || {};
-    runBackfill({ from, to }).catch((err) => console.error('[resdiary-sync] backfill failed:', err.message));
+    runBackfill({ from, to, trigger: 'manual' }).catch((err) => console.error('[resdiary-sync] backfill failed:', err.message));
     res.status(202).json({ ok: true, message: 'Backfill started — poll GET /resdiary/status' });
   });
 
@@ -513,19 +575,23 @@ function registerResdiaryRoutes(app) {
     }
     if (state.running) return res.status(409).json({ error: 'sync_already_running', phase: state.phase });
     const days = req.body?.days;
-    runReconcile({ days }).catch((err) => console.error('[resdiary-sync] reconcile failed:', err.message));
+    runReconcile({ days, trigger: 'manual' }).catch((err) => console.error('[resdiary-sync] reconcile failed:', err.message));
     res.status(202).json({ ok: true, message: 'Reconcile started — poll GET /resdiary/status' });
   });
 
-  // Optional self-timer while the app-side cron isn't shipped yet.
+  // Self-timer (the app has no cron for this). Also one run ~90s after boot:
+  // a redeploy used to open a silent gap until the next tick, and a boot run
+  // re-proves the whole path — credentials, whitelist, ingest — every deploy.
   const intervalMs = parseInt(process.env.RESDIARY_RECONCILE_INTERVAL_MS || '0', 10);
   if (intervalMs > 0 && rd.isConfigured() && ingestConfigured()) {
-    setInterval(() => {
+    const tick = (trigger) => {
       if (!state.running) {
-        runReconcile({}).catch((err) => console.error('[resdiary-sync] scheduled reconcile failed:', err.message));
+        runReconcile({ trigger }).catch((err) => console.error(`[resdiary-sync] ${trigger} reconcile failed:`, err.message));
       }
-    }, intervalMs);
-    console.log(`[resdiary-sync] self-reconcile every ${intervalMs}ms`);
+    };
+    setTimeout(() => tick('boot'), 90_000).unref?.();
+    setInterval(() => tick('timer'), intervalMs);
+    console.log(`[resdiary-sync] self-reconcile every ${intervalMs}ms (+ one run 90s after boot)`);
   }
 }
 
@@ -535,5 +601,5 @@ module.exports = {
   runReconcile,
   getStatus,
   // exported for tests
-  _internal: { listDatesInclusive, addDaysIso, chunk, unwrapList, classifyChangeRow, classifyCustomerRow, looksLikeFullBooking, looksLikeFullCustomer },
+  _internal: { listDatesInclusive, addDaysIso, chunk, unwrapList, classifyChangeRow, classifyCustomerRow, looksLikeFullBooking, looksLikeFullCustomer, pushRun, DEFAULT_RECONCILE_DAYS },
 };

@@ -147,3 +147,15 @@ test('resdiary routes: forbidden without token, 503 when unconfigured, status sh
   const rc = await fetch(base + '/resdiary/reconcile', { method: 'POST', headers: { 'X-Bridge-Token': 'test-admin-token' } });
   assert.strictEqual(rc.status, 503);
 });
+
+test('run history: newest first, capped at 50, default window is 7 days', () => {
+  const runs = [];
+  let list = [];
+  for (let i = 0; i < 55; i++) list = s.pushRun(list, { kind: 'reconcile', startedAt: String(i) });
+  assert.strictEqual(list.length, 50);
+  assert.strictEqual(list[0].startedAt, '54');
+  assert.strictEqual(list[49].startedAt, '5');
+  assert.deepStrictEqual(s.pushRun(null, { kind: 'backfill' }), [{ kind: 'backfill' }]);
+  assert.strictEqual(s.DEFAULT_RECONCILE_DAYS, 7);
+  assert.ok(Array.isArray(runs));
+});
