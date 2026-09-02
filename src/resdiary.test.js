@@ -63,19 +63,31 @@ test('unwrapList handles arrays, paging envelopes, and junk', () => {
   assert.deepStrictEqual(s.unwrapList(null), []);
 });
 
-test('classifyChangeRow: nested booking, inline booking, bare id, junk', () => {
-  assert.deepStrictEqual(s.classifyChangeRow({ Booking: { Id: 9 } }), { kind: 'booking', booking: { Id: 9 } });
+test('classifyChangeRow only ever yields an id — change records are never forwarded as bookings', () => {
+  // The 02-09-2026 clobber: an inline "booking-looking" change row must NOT come back as a booking.
   const inline = { Id: 4, VisitDateTime: '2026-08-04T19:00:00', CoversBooked: 2 };
-  assert.deepStrictEqual(s.classifyChangeRow(inline), { kind: 'booking', booking: inline });
-  assert.deepStrictEqual(s.classifyChangeRow({ BookingId: 77 }), { kind: 'id', id: 77 });
+  assert.deepStrictEqual(s.classifyChangeRow(inline), { kind: 'id', id: 4 });
+  assert.deepStrictEqual(s.classifyChangeRow({ Booking: { Id: 9 } }), { kind: 'id', id: 9 });
+  assert.deepStrictEqual(s.classifyChangeRow({ BookingId: 77, ChangeType: 'PartySize' }), { kind: 'id', id: 77 });
   assert.deepStrictEqual(s.classifyChangeRow({ Id: 12 }), { kind: 'id', id: 12 });
+  assert.deepStrictEqual(s.classifyChangeRow({ ChangeType: 'x' }), { kind: 'skip' });
   assert.deepStrictEqual(s.classifyChangeRow('x'), { kind: 'skip' });
   assert.deepStrictEqual(s.classifyChangeRow(null), { kind: 'skip' });
 });
 
-test('classifyCustomerRow unwraps nested Customer', () => {
-  assert.deepStrictEqual(s.classifyCustomerRow({ Customer: { Id: 1 } }), { Id: 1 });
+test('looksLikeFullBooking requires a party size AND a visit instant', () => {
+  assert.strictEqual(s.looksLikeFullBooking({ Id: 1, CoversBooked: 2, VisitDateTime: '2026-08-29T19:45:00' }), true);
+  assert.strictEqual(s.looksLikeFullBooking({ Id: 1, PartySize: 0, VisitDate: '2026-08-29' }), true); // 0 covers is a value
+  assert.strictEqual(s.looksLikeFullBooking({ Id: 1, VisitDateTime: '2026-08-29T19:45:00' }), false); // stub: no covers
+  assert.strictEqual(s.looksLikeFullBooking({ Id: 1, CoversBooked: 2 }), false); // stub: no visit
+  assert.strictEqual(s.looksLikeFullBooking(null), false);
+});
+
+test('classifyCustomerRow forwards only records with real contact/name fields', () => {
+  assert.deepStrictEqual(s.classifyCustomerRow({ Customer: { Id: 1, Email: 'a@b.c' } }), { Id: 1, Email: 'a@b.c' });
   assert.deepStrictEqual(s.classifyCustomerRow({ Id: 2, Email: 'x@y.z' }), { Id: 2, Email: 'x@y.z' });
+  assert.strictEqual(s.classifyCustomerRow({ Id: 3, ChangeType: 'CustomerEmailChanged' }), null); // stub
+  assert.strictEqual(s.classifyCustomerRow({ Customer: { Id: 1 } }), null); // stub
   assert.strictEqual(s.classifyCustomerRow(null), null);
 });
 
