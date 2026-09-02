@@ -472,6 +472,14 @@ function registerResdiaryRoutes(app) {
     if (!rd.isConfigured()) return res.status(503).json({ error: 'resdiary_not_configured' });
     const day = String(req.query.date || toDateIso(Date.now()));
     try {
+      // ?bookingId= — one full record, verbatim: settles "what does Data
+      // Extract actually say about THIS booking" (service name vs description,
+      // promotions shape) without guessing from a date's first change row.
+      if (req.query.bookingId) {
+        const id = String(req.query.bookingId);
+        const one = await rd.getBookingById(id);
+        return res.json({ bookingId: id, looksFull: looksLikeFullBooking(one), fullBooking: one });
+      }
       const changeRows = unwrapList(await rd.getBookingChanges(day));
       const custRows = unwrapList(await rd.getCustomerChanges(day));
       const first = classifyChangeRow(changeRows[0]);
