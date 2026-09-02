@@ -61,6 +61,17 @@ function chunk(arr, size) {
   return out;
 }
 
+/**
+ * A record the app may overwrite a booking with: it must carry a party size
+ * and a visit instant. Anything thinner is a stub and would only blank fields.
+ */
+function looksLikeFullBooking(b) {
+  if (!b || typeof b !== 'object') return false;
+  const covers = b.PartySize ?? b.CoversBooked ?? b.Covers;
+  const visit = b.VisitDateTime ?? b.VisitDate;
+  return covers !== undefined && covers !== null && !!visit;
+}
+
 /** ResDiary list responses are either bare arrays or a paging envelope. */
 function unwrapList(body) {
   if (Array.isArray(body)) return body;
@@ -69,22 +80,33 @@ function unwrapList(body) {
 }
 
 /**
- * A BookingChange row's exact shape is undocumented; be liberal. Returns a
- * booking object, or an id for `fetchById`, or null to skip.
+ * A BookingChange row is a MODIFICATION record, not a booking. Forwarding it
+ * as one is how the 02-09-2026 reconcile blanked covers/reference/spend on
+ * every booking touched in six days (the app's upsert overwrote good fields
+ * with the stub's blanks). So the only thing a change row is trusted for is
+ * the booking ID — the full record is always fetched with `Booking/{id}`.
+ * Rows without any id are skipped, never forwarded.
  */
 function classifyChangeRow(row) {
   if (!row || typeof row !== 'object') return { kind: 'skip' };
-  if (row.Booking && typeof row.Booking === 'object') return { kind: 'booking', booking: row.Booking };
-  if (row.VisitDateTime || row.BookingReference) return { kind: 'booking', booking: row };
-  const id = row.BookingId ?? row.Id;
-  if (id !== undefined && id !== null) return { kind: 'id', id };
+  const nested = row.Booking && typeof row.Booking === 'object' ? row.Booking : null;
+  const id = row.BookingId ?? nested?.Id ?? nested?.BookingId ?? row.Id;
+  if (id !== undefined && id !== null && id !== '') return { kind: 'id', id };
   return { kind: 'skip' };
+}
+
+/** A customer record we can safely forward — a CustomerChange stub with none
+ *  of these carries nothing the app can use and could only blank things. */
+function looksLikeFullCustomer(row) {
+  if (!row || typeof row !== 'object') return false;
+  return ['Email', 'EmailAddress', 'FirstName', 'Surname', 'LastName', 'Mobile', 'MobileNumber', 'Name']
+    .some((k) => row[k] !== undefined && row[k] !== null && row[k] !== '');
 }
 
 function classifyCustomerRow(row) {
   if (!row || typeof row !== 'object') return null;
-  if (row.Customer && typeof row.Customer === 'object') return row.Customer;
-  return row;
+  const cust = row.Customer && typeof row.Customer === 'object' ? row.Customer : row;
+  return looksLikeFullCustomer(cust) ? cust : null;
 }
 
 // ── Cursor ────────────────────────────────────────────────────────────
@@ -243,23 +265,34 @@ async function runReconcile({ days = 2 } = {}) {
   state.startedAt = new Date().toISOString();
   state.lastError = null;
 
-  const counts = { days: n, bookings: 0, customers: 0 };
+  const counts = { days: n, bookings: 0, customers: 0, fetched: 0, skippedStubs: 0 };
+  state.counts = counts; // live progress in /resdiary/status
   try {
     const today = toDateIso(Date.now());
     for (let i = n - 1; i >= 0; i--) {
       const day = addDaysIso(today, -i);
 
+      // Change rows → the SET of booking ids touched that day → full records.
       const changeRows = unwrapList(await rd.getBookingChanges(day));
-      const bookings = [];
+      const ids = new Set();
       for (const row of changeRows) {
         const c = classifyChangeRow(row);
-        if (c.kind === 'booking') bookings.push(c.booking);
-        else if (c.kind === 'id') {
-          try {
-            bookings.push(await rd.getBookingById(c.id));
-          } catch (err) {
-            console.warn(`[resdiary-sync] booking ${c.id} fetch failed:`, err.message);
+        if (c.kind === 'id') ids.add(String(c.id));
+        else counts.skippedStubs++;
+      }
+      const bookings = [];
+      for (const id of ids) {
+        try {
+          const full = await rd.getBookingById(id);
+          if (looksLikeFullBooking(full)) {
+            bookings.push(full);
+            counts.fetched++;
+          } else {
+            counts.skippedStubs++;
+            console.warn(`[resdiary-sync] booking ${id}: fetched record has no covers/visit — not forwarded`);
           }
+        } catch (err) {
+          console.warn(`[resdiary-sync] booking ${id} fetch failed:`, err.message);
         }
       }
       for (const batch of chunk(bookings, INGEST_CHUNK)) {
@@ -431,6 +464,29 @@ function registerResdiaryRoutes(app) {
     }
   });
 
+  // Shape inspection: what a change row, a full booking and a customer-change
+  // row actually look like for one date. Read-only; the reconcile bug of
+  // 02-09-2026 came from never having seen these.
+  app.get('/resdiary/peek', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.isConfigured()) return res.status(503).json({ error: 'resdiary_not_configured' });
+    const day = String(req.query.date || toDateIso(Date.now()));
+    try {
+      const changeRows = unwrapList(await rd.getBookingChanges(day));
+      const custRows = unwrapList(await rd.getCustomerChanges(day));
+      const first = classifyChangeRow(changeRows[0]);
+      const fullBooking = first.kind === 'id' ? await rd.getBookingById(first.id) : null;
+      res.json({
+        date: day,
+        bookingChanges: { count: changeRows.length, sample: changeRows[0] ?? null },
+        fullBooking: { sample: fullBooking, looksFull: looksLikeFullBooking(fullBooking) },
+        customerChanges: { count: custRows.length, sample: custRows[0] ?? null },
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   app.post('/resdiary/backfill', (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.isConfigured() || !ingestConfigured()) {
@@ -471,5 +527,5 @@ module.exports = {
   runReconcile,
   getStatus,
   // exported for tests
-  _internal: { listDatesInclusive, addDaysIso, chunk, unwrapList, classifyChangeRow, classifyCustomerRow },
+  _internal: { listDatesInclusive, addDaysIso, chunk, unwrapList, classifyChangeRow, classifyCustomerRow, looksLikeFullBooking, looksLikeFullCustomer },
 };
