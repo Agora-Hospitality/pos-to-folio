@@ -109,9 +109,49 @@ function looksLikeFullCustomer(row) {
     .some((k) => row[k] !== undefined && row[k] !== null && row[k] !== '');
 }
 
+/** Anything the API probe creates carries this in its email. */
+const PROBE_EMAIL_PREFIX = 'zz-api-probe-';
+
+/** A customer WE fabricated to test the vendor API is not a guest of this
+ *  hotel. Without this the reconcile's CustomerChange walk ships it to
+ *  /api/resdiary/ingest and a junk guest profile appears in production — one
+ *  hop downstream of a route whose whole promise was that it touches nobody
+ *  real. Marking it deleted in ResDiary afterwards does not retract that. */
+function isProbeCustomer(cust) {
+  return typeof cust?.EmailAddress === 'string' && cust.EmailAddress.startsWith(PROBE_EMAIL_PREFIX)
+      || typeof cust?.Email === 'string' && cust.Email.startsWith(PROBE_EMAIL_PREFIX);
+}
+
+/**
+ * What the append attempt actually told us.
+ *
+ * Status BEFORE content. NOT_WRITABLE is reserved for the vendor refusing;
+ * everything we merely could not read is UNDETERMINED, because the whole point
+ * of this probe is to stop us concluding "not entitled" from a signal that
+ * meant something else — which is exactly what happened with Reviews.
+ */
+function verdictOf(r) {
+  if (!r) return { verdict: 'UNDETERMINED_TRANSPORT', note: 'The call never completed — a block or a timeout, not an answer.' };
+  const s = r.status;
+  if (s === 401 || s === 403) return { verdict: 'REFUSED', note: `The API refused with ${s} — this account is not entitled to write a customer.` };
+  if (s === 404) return { verdict: 'PATH_OR_ID_WRONG', note: 'A 404 is the route or the id, not a refusal.' };
+  if (typeof s === 'number' && s >= 400) return { verdict: `REJECTED_${s}`, note: 'The write was rejected — read the body; a 400 usually means the PUT wants the whole record.' };
+
+  const comments = typeof r.body?.Comments === 'string' ? r.body.Comments : null;
+  if (comments === null) {
+    return { verdict: 'UNDETERMINED_NO_BODY', note: `The write returned ${s} but no readable Comments, so whether it appended cannot be told from here. Check the customer in the diary.` };
+  }
+  const keptFirst = comments.includes('first note');
+  const gotSecond = comments.includes('appended note');
+  if (gotSecond && keptFirst) return { verdict: 'APPEND_WORKS', comments, note: 'Both notes survived — AppendComments does what the docs say.' };
+  if (gotSecond) return { verdict: 'WRITE_WORKS_BUT_REPLACES', comments, note: 'The write landed but the earlier note was lost — read-modify-write is required.' };
+  return { verdict: 'WRITE_IGNORED', comments, note: `The API answered ${s} but neither note is present — Comments looks read-only, as it is on a booking.` };
+}
+
 function classifyCustomerRow(row) {
   if (!row || typeof row !== 'object') return null;
   const cust = row.Customer && typeof row.Customer === 'object' ? row.Customer : row;
+  if (isProbeCustomer(cust)) return null;
   return looksLikeFullCustomer(cust) ? cust : null;
 }
 
@@ -476,6 +516,126 @@ function registerResdiaryRoutes(app) {
   // Discovery: CurrentUser + Restaurants — run this the moment ResDiary
   // confirms the IP whitelist; the response carries providerId/deploymentId/
   // micrositeName for the env config.
+  /**
+   * POST /resdiary/customer-note-probe — can we write a guest note, or not?
+   *
+   * ResDiary's docs say `PUT .../Customer/{customerId}/` takes `Comments` and a
+   * `CustomerOptions[AppendComments]` flag. Docs are not entitlement: the
+   * Reviews endpoint was documented for us too and answered 404 for a month.
+   * This settles it against the live API, from the whitelisted IP.
+   *
+   * ── The rules it obeys, each one earned ────────────────────────────────
+   * 1. It creates its own throwaway customer and NEVER writes to an id it
+   *    cannot prove is that customer. A create that fails can still answer with
+   *    an EXISTING customer's id (a duplicate-email envelope is the usual
+   *    shape), and blindly trusting it would put a junk note on a real diner
+   *    and mark them for deletion. So the create must be 2xx AND echo our own
+   *    marker back before anything else runs.
+   * 2. A missing or unreadable body is UNDETERMINED, never "not writable". An
+   *    empty 200 is the normal answer to an update; calling that a refusal
+   *    would be the loudest possible lie.
+   * 3. The verdict reads the STATUS before the content, so a 403, a 404, a 400
+   *    and a network failure are four different answers rather than one.
+   * 4. Cleanup runs in a `finally` AND its result is in the response, because a
+   *    report that cannot say whether it tidied up is not a report. It also
+   *    goes to the log, so the answer survives even if the caller drops it.
+   * 5. The throwaway is filtered out of the reconcile by `isProbeCustomer`, so
+   *    it can never reach the app's guest table.
+   */
+  app.post('/resdiary/customer-note-probe', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    const steps = [];
+    const step = async (name, fn) => {
+      try {
+        const r = await fn();
+        // The envelope verbatim — never `?? r`, which turns an empty 200 body
+        // into the envelope and makes a successful write look like a refusal.
+        steps.push({ name, ok: r?.ok === true, status: r?.status ?? null, body: r && 'body' in r ? r.body : null });
+        return r;
+      } catch (err) {
+        // A throw is a TRANSPORT failure (Cloudflare, retries exhausted) and
+        // must never be read as the vendor saying no.
+        steps.push({ name, ok: false, status: null, transportError: err.message });
+        return null;
+      }
+    };
+
+    const stamp = Date.now();
+    const email = `${PROBE_EMAIL_PREFIX}${stamp}@theagorahotel.com`;
+    const surname = `Probe ${stamp}`;
+    const base = `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}`;
+
+    let customerId = null;
+    let payload = null;
+
+    try {
+      const created = await step('createCustomer', () =>
+        rd.rdSend('POST', `${base}/Customer`, {
+          Title: 'Mr',
+          FirstName: 'API',
+          Surname: surname,
+          Email: email,
+          ReceiveEmailMarketing: false,
+          ReceiveSmsMarketing: false,
+          Comments: 'probe: first note',
+        }));
+
+      if (!created || created.ok !== true) {
+        payload = { ok: false, verdict: 'CREATE_FAILED', note: 'The create did not return 2xx — nothing was written.' };
+      } else {
+        // Prove the row is OURS before touching it. An id alone is not proof.
+        const b = created.body || {};
+        const echoesUs =
+          String(b.Email ?? b.EmailAddress ?? '') === email ||
+          String(b.Surname ?? '').includes(String(stamp));
+        const id = b.Id ?? b.CustomerId ?? null;
+
+        if (!id || !echoesUs) {
+          payload = {
+            ok: false,
+            verdict: 'CREATE_UNVERIFIED',
+            note: 'The create response did not echo our marker back, so we cannot prove this id is the customer we made. Refusing to write to it or delete it.',
+          };
+        } else {
+          customerId = id;
+          const appended = await step('appendNote', () =>
+            rd.rdSend('PUT', `${base}/Customer/${customerId}/`, {
+              Comments: 'probe: appended note',
+              'CustomerOptions[AppendComments]': true,
+            }));
+
+          payload = { ok: true, customerId, ...verdictOf(appended) };
+        }
+      }
+    } finally {
+      if (customerId) {
+        // Shape is not in the docs section we read, so try both spellings.
+        const a = await step('markForDeletion:CustomerIds[0]', () =>
+          rd.rdSend('POST', `${base}/Customers/MarkForDeletion`, { 'CustomerIds[0]': customerId }));
+        if (!a || a.ok !== true) {
+          await step('markForDeletion:CustomerIds', () =>
+            rd.rdSend('POST', `${base}/Customers/MarkForDeletion`, { CustomerIds: customerId }));
+        }
+      }
+      const cleanup = steps.filter((x) => x.name.startsWith('markForDeletion'));
+      const tidied = cleanup.some((x) => x.ok);
+      // Logged as well as returned: if the caller drops the response, Railway
+      // still holds the answer to "did we leave a row behind".
+      console.log('[resdiary-probe]', JSON.stringify({ customerId, tidied, cleanup }));
+      res.json({
+        ...(payload || { ok: false, verdict: 'ABORTED' }),
+        cleanedUp: customerId ? tidied : 'nothing_to_clean',
+        leftBehind: customerId && !tidied ? { customerId, surname, email } : null,
+        steps,
+      });
+    }
+  });
+
   app.get('/resdiary/whoami', async (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });

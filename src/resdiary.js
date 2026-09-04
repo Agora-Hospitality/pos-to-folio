@@ -238,6 +238,71 @@ async function rdGet(apiPath, { query } = {}) {
   throw lastErr || new Error(`ResDiary ${apiPath}: retries exhausted`);
 }
 
+/**
+ * The write twin of `rdGet`.
+ *
+ * Same throttle, same 1s/3s/9s backoff, same single forced re-auth on a 401,
+ * same Cloudflare detection — a write must not behave differently from a read
+ * when the vendor wobbles. The body is FORM-ENCODED, not JSON: every Consumer
+ * API write in ResDiary's docs is shown as `curl -d Field=Value`.
+ *
+ * Retries are safe here only because every caller so far is idempotent or
+ * creates something it then deletes. Do NOT reuse this for an endpoint where a
+ * repeat would double-charge or double-book without thinking about it first.
+ */
+async function rdSend(method, apiPath, form = {}) {
+  const url = new URL(BASE + apiPath);
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(form)) {
+    if (v !== undefined && v !== null) body.set(k, String(v));
+  }
+
+  let reauthed = false;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt > 0) await sleep(1000 * 3 ** (attempt - 1));
+    await throttle();
+    let res, text;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${await getToken()}`,
+          'User-Agent': USER_AGENT,
+          Accept: 'application/json, text/plain, */*',
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: body.toString(),
+        signal: AbortSignal.timeout(60_000),
+      });
+      text = await res.text();
+    } catch (err) {
+      lastErr = err;
+      continue;
+    }
+
+    if (looksBlocked(res.status, text)) throw new CloudflareBlockedError(res.status, text.slice(0, 120));
+
+    if (res.status === 401 && !reauthed) {
+      reauthed = true;
+      await getToken(true);
+      attempt--;
+      continue;
+    }
+    if (res.status === 429 || res.status >= 500) {
+      lastErr = new Error(`ResDiary ${method} ${apiPath} HTTP ${res.status}`);
+      continue;
+    }
+
+    // A 4xx is INFORMATION here, not a fault — a 403 is the entitlement answer
+    // this exists to get. Hand the status and body back rather than throwing.
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text.slice(0, 400); }
+    return { ok: res.ok, status: res.status, body: parsed };
+  }
+  throw lastErr || new Error(`ResDiary ${method} ${apiPath}: retries exhausted`);
+}
+
 // ── Endpoints ────────────────────────────────────────────────────────
 
 /** Account discovery — works with creds alone, no deployment/provider ids. */
@@ -271,6 +336,11 @@ async function getRestaurants() {
  * the payload verbatim and normalises it. Guessing a schema here would bake a
  * wrong assumption into the one place that is hard to see into.
  */
+/** The microsite the Consumer API is keyed on. */
+function micrositeName() {
+  return process.env.RESDIARY_MICROSITE_NAME || '';
+}
+
 async function getReviews({ micrositeName, sortBy = 'Newest', page = 1, pageSize = 20 } = {}) {
   const site = micrositeName || process.env.RESDIARY_MICROSITE_NAME || '';
   if (!site) {
@@ -348,6 +418,8 @@ module.exports = {
   getCurrentUser,
   getRestaurants,
   getReviews,
+  rdSend,
+  micrositeName,
   getEarliestBookingDate,
   getBookingsForDate,
   getBookingById,
