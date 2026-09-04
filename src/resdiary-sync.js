@@ -580,6 +580,12 @@ function registerResdiaryRoutes(app) {
           FirstName: 'API',
           Surname: surname,
           Email: email,
+          // ResDiary refuses a customer with neither a mobile nor a landline
+          // ("Either a mobile or a landline number must be supplied"). Derived
+          // from the stamp so two probes never collide, and in a range that
+          // cannot be a real Cyprus mobile.
+          MobileCountryCode: 357,
+          Mobile: `99${String(stamp).slice(-6)}`,
           ReceiveEmailMarketing: false,
           ReceiveSmsMarketing: false,
           Comments: 'probe: first note',
