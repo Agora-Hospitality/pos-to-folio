@@ -437,5 +437,5 @@ module.exports = {
   runEposDemo,
   registerEposRoutes,
   // exported for tests
-  _internal: { pct, baseString, hmacSign, parseTokenResponse, oauthBase, splitUrl, buildOAuthHeader, dotNetDate, buildReceiptXml, findFirstTableId },
+  _internal: { pct, baseString, hmacSign, parseTokenResponse, oauthBase, splitUrl, buildOAuthHeader, dotNetDate, buildReceiptXml, findFirstTableId, eposFetch },
 };

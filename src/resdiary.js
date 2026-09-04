@@ -271,7 +271,7 @@ async function getRestaurants() {
  * the payload verbatim and normalises it. Guessing a schema here would bake a
  * wrong assumption into the one place that is hard to see into.
  */
-async function getReviews({ micrositeName, fromDate, toDate } = {}) {
+async function getReviews({ micrositeName, sortBy = 'Newest', page = 1, pageSize = 20 } = {}) {
   const site = micrositeName || process.env.RESDIARY_MICROSITE_NAME || '';
   if (!site) {
     throw new Error(
@@ -279,8 +279,16 @@ async function getReviews({ micrositeName, fromDate, toDate } = {}) {
       'or from any webhook payload (MicrositeName), or via /resdiary/whoami once data calls work',
     );
   }
+  // sortBy/page/pageSize are the ONLY parameters this endpoint takes.
+  //
+  // This used to send fromDate/toDate, which we invented — ResDiary has no such
+  // parameters — and the endpoint answered 404 for two days while we concluded
+  // the account was not entitled to Reviews at all. It is: Ciorstaidh MacLeod
+  // (The Access Group, 03-09-2026) confirmed the endpoint is available to us and
+  // gave the canonical form, which is exactly the three below. Do not add a
+  // parameter here that is not in ResDiary's own documentation.
   return rdGet(`/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Reviews`, {
-    query: { fromDate, toDate },
+    query: { sortBy, page, pageSize },
   });
 }
 
