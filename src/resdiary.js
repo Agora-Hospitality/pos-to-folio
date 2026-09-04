@@ -336,6 +336,17 @@ async function getRestaurants() {
  * the payload verbatim and normalises it. Guessing a schema here would bake a
  * wrong assumption into the one place that is hard to see into.
  */
+/**
+ * One customer, by id. Update Customer is a WHOLE-RECORD replace, so writing a
+ * note means reading the record first and sending it back with the one field
+ * changed — anything omitted is anything lost.
+ */
+async function getCustomerById(customerId, micrositeName) {
+  const site = micrositeName || process.env.RESDIARY_MICROSITE_NAME || '';
+  if (!site) throw new Error('RESDIARY_MICROSITE_NAME not set');
+  return rdGet(`/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Customer/${customerId}`);
+}
+
 /** The microsite the Consumer API is keyed on. */
 function micrositeName() {
   return process.env.RESDIARY_MICROSITE_NAME || '';
@@ -420,6 +431,7 @@ module.exports = {
   getReviews,
   rdSend,
   micrositeName,
+  getCustomerById,
   getEarliestBookingDate,
   getBookingsForDate,
   getBookingById,

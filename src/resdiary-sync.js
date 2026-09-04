@@ -542,6 +542,102 @@ function registerResdiaryRoutes(app) {
    * 5. The throwaway is filtered out of the reconcile by `isProbeCustomer`, so
    *    it can never reach the app's guest table.
    */
+  /**
+   * POST /resdiary/customer-note — write a note onto a ResDiary guest.
+   *
+   * Body: { customerId, note, vip?: boolean }
+   *
+   * Proven against the live API on 04-09-2026 (see /resdiary/customer-note-probe):
+   * `PUT .../Customer/{id}/` is a WHOLE-RECORD replace — send only `Comments`
+   * and it answers 400 "The email address must be supplied" — but
+   * `CustomerOptions[AppendComments]=true` genuinely appends, CRLF-separated.
+   *
+   * So: read the record, send it back with the note appended. The read is not
+   * optional and there is no fallback to "send what the caller thinks the
+   * customer looks like" — a stale name or email from our side would overwrite
+   * ResDiary's copy, and a note is never worth doing that for.
+   *
+   * `vip` is only sent when the caller passes it, because omitting a field on a
+   * whole-record PUT is how you silently clear it.
+   */
+  app.post('/resdiary/customer-note', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    const { customerId, note, vip } = req.body || {};
+    if (!customerId || !String(note || '').trim()) {
+      return res.status(400).json({ error: 'expected { customerId, note }' });
+    }
+    if (vip !== undefined && typeof vip !== 'boolean') {
+      return res.status(400).json({ error: 'vip must be a boolean when supplied' });
+    }
+
+    try {
+      // 1. Read. Whatever comes back is what gets sent back.
+      let before;
+      try {
+        before = await rd.getCustomerById(customerId, site);
+      } catch (err) {
+        return res.status(502).json({
+          error: `could not read customer ${customerId}: ${err.message}`,
+          hint: 'Update Customer replaces the whole record, so it is not safe to write without reading first.',
+        });
+      }
+      if (!before || typeof before !== 'object' || !before.Id) {
+        return res.status(404).json({ error: `customer ${customerId} not found` });
+      }
+
+      // 2. Send it back, with the note appended and nothing else disturbed.
+      const form = {
+        Title: before.Title ?? '',
+        FirstName: before.FirstName ?? '',
+        Surname: before.Surname ?? '',
+        Email: before.Email ?? '',
+        MobileCountryCode: before.MobileCountryCode ?? '',
+        Mobile: before.Mobile ?? '',
+        PhoneCountryCode: before.PhoneCountryCode ?? '',
+        Phone: before.Phone ?? '',
+        ReceiveEmailMarketing: before.ReceiveEmailMarketing ?? false,
+        ReceiveSmsMarketing: before.ReceiveSmsMarketing ?? false,
+        Comments: String(note).trim(),
+        'CustomerOptions[AppendComments]': true,
+        ...(vip === undefined ? {} : { IsVip: vip }),
+      };
+
+      const put = await rd.rdSend('PUT', `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Customer/${customerId}/`, form);
+
+      if (!put.ok) {
+        return res.status(502).json({
+          error: `ResDiary refused the write (HTTP ${put.status})`,
+          status: put.status,
+          body: put.body,
+        });
+      }
+
+      // 3. Prove it from the response rather than assuming the 200 meant it.
+      const after = put.body?.Comments ?? null;
+      const landed = typeof after === 'string' && after.includes(String(note).trim());
+      return res.json({
+        ok: landed,
+        customerId,
+        landed,
+        commentsBefore: before.Comments ?? null,
+        commentsAfter: after,
+        ...(vip === undefined ? {} : { vipRequested: vip, vipAfter: put.body?.IsVip ?? null }),
+        ...(landed ? {} : { note: 'The write returned 200 but the note is not in the response — check the diner in ResDiary before trusting it.' }),
+      });
+    } catch (err) {
+      const blocked = err instanceof rd.CloudflareBlockedError;
+      return res.status(blocked ? 502 : 500).json({
+        error: err.message,
+        ...(blocked ? { hint: 'This egress IP is not whitelisted by ResDiary.' } : {}),
+      });
+    }
+  });
+
   app.post('/resdiary/customer-note-probe', async (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
