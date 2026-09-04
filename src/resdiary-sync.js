@@ -626,9 +626,28 @@ function registerResdiaryRoutes(app) {
               ReceiveSmsMarketing: b.ReceiveSmsMarketing ?? false,
               Comments: 'probe: appended note',
               'CustomerOptions[AppendComments]': true,
+              // Does the VIP flag travel too? It is on the customer record we
+              // get back (`IsVip`), but ResDiary's documented PUT body does not
+              // list it — so ask rather than assume.
+              IsVip: true,
             }));
 
-          payload = { ok: true, customerId, ...verdictOf(appended) };
+          payload = {
+            ok: true,
+            customerId,
+            ...verdictOf(appended),
+            // Reported separately from the note verdict: VIP is a different
+            // question and a different answer is perfectly possible.
+            vip: {
+              sentIsVip: true,
+              createdAs: appended && appended.body ? undefined : null,
+              cameBack: appended?.body?.IsVip ?? null,
+              verdict:
+                appended?.body?.IsVip === true ? 'VIP_WRITABLE'
+                : appended?.body?.IsVip === false ? 'VIP_IGNORED'
+                : 'VIP_UNDETERMINED',
+            },
+          };
         }
       }
     } finally {
