@@ -609,8 +609,21 @@ function registerResdiaryRoutes(app) {
           };
         } else {
           customerId = id;
+          // Update Customer is a WHOLE-RECORD replace: sending Comments alone
+          // returns 400 "The email address must be supplied". So the real usage
+          // pattern — and this probe — must echo the record back and change the
+          // one field. `AppendComments` then decides whether the note is added
+          // to the old one or replaces it, which is the whole question.
           const appended = await step('appendNote', () =>
             rd.rdSend('PUT', `${base}/Customer/${customerId}/`, {
+              Title: b.Title ?? 'Mr',
+              FirstName: b.FirstName ?? 'API',
+              Surname: b.Surname ?? surname,
+              Email: b.Email ?? email,
+              MobileCountryCode: b.MobileCountryCode ?? 357,
+              Mobile: b.Mobile ?? '',
+              ReceiveEmailMarketing: b.ReceiveEmailMarketing ?? false,
+              ReceiveSmsMarketing: b.ReceiveSmsMarketing ?? false,
               Comments: 'probe: appended note',
               'CustomerOptions[AppendComments]': true,
             }));
