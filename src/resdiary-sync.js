@@ -501,7 +501,15 @@ function registerResdiaryRoutes(app) {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
     try {
-      const payload = await rd.getReviews({ fromDate: req.query.from, toDate: req.query.to });
+      // One page per call, caller-driven: until a real payload has been seen we
+      // cannot know how this endpoint signals "no more pages", so walking them
+      // automatically would be a guess. ?raw=1 returns it verbatim and writes
+      // nothing — use that first.
+      const payload = await rd.getReviews({
+        sortBy: req.query.sortBy || 'Newest',
+        page: Number(req.query.page) || 1,
+        pageSize: Math.min(Number(req.query.pageSize) || 20, 100),
+      });
       if (req.query.raw === '1') return res.json({ ok: true, payload });
 
       const { url, token } = appTarget();
