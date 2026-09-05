@@ -250,7 +250,17 @@ async function rdGet(apiPath, { query } = {}) {
  * creates something it then deletes. Do NOT reuse this for an endpoint where a
  * repeat would double-charge or double-book without thinking about it first.
  */
-async function rdSend(method, apiPath, form = {}) {
+/**
+ * @param {object} [opts]
+ * @param {number} [opts.maxAttempts=4] How many times to try.
+ *   Retrying is right for an idempotent write and WRONG for a read-modify-write:
+ *   the body was computed from a blob read before the first attempt, so a retry
+ *   re-PUTs a whole customer record derived from a read that may now be minutes
+ *   stale, overwriting whatever changed in between. `/customer-note/replace`
+ *   passes 1 for exactly that reason.
+ */
+async function rdSend(method, apiPath, form = {}, opts = {}) {
+  const maxAttempts = Number.isInteger(opts.maxAttempts) && opts.maxAttempts > 0 ? opts.maxAttempts : 4;
   const url = new URL(BASE + apiPath);
   const body = new URLSearchParams();
   for (const [k, v] of Object.entries(form)) {
@@ -259,7 +269,7 @@ async function rdSend(method, apiPath, form = {}) {
 
   let reauthed = false;
   let lastErr = null;
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (attempt > 0) await sleep(1000 * 3 ** (attempt - 1));
     await throttle();
     let res, text;

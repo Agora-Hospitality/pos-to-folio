@@ -20,6 +20,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const rd = require('./resdiary');
+const { findBlockOnBoundary, spliceBlock, verifySplice, withCustomerLock } = require('./blob');
 
 const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
@@ -120,6 +121,69 @@ const PROBE_EMAIL_PREFIX = 'zz-api-probe-';
 function isProbeCustomer(cust) {
   return typeof cust?.EmailAddress === 'string' && cust.EmailAddress.startsWith(PROBE_EMAIL_PREFIX)
       || typeof cust?.Email === 'string' && cust.Email.startsWith(PROBE_EMAIL_PREFIX);
+}
+
+/**
+ * The whole customer record, echoed back with the one field we mean to change.
+ *
+ * `PUT .../Customer/{id}/` is a WHOLE-RECORD replace: whatever this object
+ * omits, ResDiary clears. The first version of this listed ten fields by hand,
+ * which meant every note we appended silently wiped anything outside that list
+ * — address, date of birth, company, language, tags, custom fields — on a real
+ * diner's record. An adversarial review found it; it was live from 04-09-2026.
+ *
+ * So the rule is now inverted: echo back EVERY scalar the GET handed us, and
+ * name only the handful we must not send. Objects and arrays are dropped
+ * because a form-encoded PUT cannot carry them meaningfully — if ResDiary
+ * turns out to hold something structured we care about, that is a finding for
+ * the probe, not something to guess at here.
+ *
+ * The ten known-required fields are still defaulted explicitly, so a record
+ * that comes back sparse still satisfies the validator ("The email address
+ * must be supplied").
+ */
+const FORM_NEVER_SEND = new Set([
+  'Comments',        // we always set this ourselves
+  'Id', 'CustomerId', // identity lives in the URL
+]);
+
+function customerFormFrom(before, changes = {}) {
+  const b = before && typeof before === 'object' ? before : {};
+  const form = {
+    Title: b.Title ?? '',
+    FirstName: b.FirstName ?? '',
+    Surname: b.Surname ?? '',
+    Email: b.Email ?? b.EmailAddress ?? '',
+    MobileCountryCode: b.MobileCountryCode ?? '',
+    Mobile: b.Mobile ?? '',
+    PhoneCountryCode: b.PhoneCountryCode ?? '',
+    Phone: b.Phone ?? '',
+    ReceiveEmailMarketing: b.ReceiveEmailMarketing ?? false,
+    ReceiveSmsMarketing: b.ReceiveSmsMarketing ?? false,
+  };
+  for (const [k, v] of Object.entries(b)) {
+    if (FORM_NEVER_SEND.has(k)) continue;
+    if (k in form) continue;
+    if (v === null || v === undefined) continue;
+    const t = typeof v;
+    if (t === 'string' || t === 'number' || t === 'boolean') form[k] = v;
+  }
+  if (changes.comments !== undefined) form.Comments = changes.comments;
+  if (changes.appendComments) form['CustomerOptions[AppendComments]'] = true;
+  if (changes.vip !== undefined) form.IsVip = changes.vip;
+  return form;
+}
+
+/** Which fields the GET returned that our PUT could not carry. Reported, never
+ *  silently dropped — this is how we find out the form is losing data. */
+function unsentScalarKeys(before, form) {
+  const b = before && typeof before === 'object' ? before : {};
+  return Object.keys(b).filter((k) => {
+    const v = b[k];
+    if (v === null || v === undefined) return false;
+    const t = typeof v;
+    return (t !== 'string' && t !== 'number' && t !== 'boolean') && !(k in form);
+  });
 }
 
 /**
@@ -591,21 +655,11 @@ function registerResdiaryRoutes(app) {
       }
 
       // 2. Send it back, with the note appended and nothing else disturbed.
-      const form = {
-        Title: before.Title ?? '',
-        FirstName: before.FirstName ?? '',
-        Surname: before.Surname ?? '',
-        Email: before.Email ?? '',
-        MobileCountryCode: before.MobileCountryCode ?? '',
-        Mobile: before.Mobile ?? '',
-        PhoneCountryCode: before.PhoneCountryCode ?? '',
-        Phone: before.Phone ?? '',
-        ReceiveEmailMarketing: before.ReceiveEmailMarketing ?? false,
-        ReceiveSmsMarketing: before.ReceiveSmsMarketing ?? false,
-        Comments: String(note).trim(),
-        'CustomerOptions[AppendComments]': true,
-        ...(vip === undefined ? {} : { IsVip: vip }),
-      };
+      const form = customerFormFrom(before, {
+        comments: String(note).trim(),
+        appendComments: true,
+        ...(vip === undefined ? {} : { vip }),
+      });
 
       const put = await rd.rdSend('PUT', `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Customer/${customerId}/`, form);
 
@@ -618,16 +672,159 @@ function registerResdiaryRoutes(app) {
       }
 
       // 3. Prove it from the response rather than assuming the 200 meant it.
-      const after = put.body?.Comments ?? null;
-      const landed = typeof after === 'string' && after.includes(String(note).trim());
+      //
+      // Boundary-matched, not `String.includes`: a note that is a substring of
+      // a line already in the blob would otherwise report as landed without
+      // having been written, and the reverse mistake — see verifySplice — turns
+      // a good additive edit into a false failure the user re-ticks.
+      const after = typeof put.body?.Comments === 'string' ? put.body.Comments : null;
+      const landed = after === null ? null : findBlockOnBoundary(after, String(note).trim()).length >= 1;
       return res.json({
-        ok: landed,
+        ok: landed === true,
         customerId,
+        // null means the write went out and the answer carried no Comments —
+        // UNDETERMINED. The caller must not read that as a failure and retry.
         landed,
         commentsBefore: before.Comments ?? null,
         commentsAfter: after,
+        droppedFields: unsentScalarKeys(before, form),
         ...(vip === undefined ? {} : { vipRequested: vip, vipAfter: put.body?.IsVip ?? null }),
         ...(landed ? {} : { note: 'The write returned 200 but the note is not in the response — check the diner in ResDiary before trusting it.' }),
+      });
+    } catch (err) {
+      const blocked = err instanceof rd.CloudflareBlockedError;
+      return res.status(blocked ? 502 : 500).json({
+        error: err.message,
+        ...(blocked ? { hint: 'This egress IP is not whitelisted by ResDiary.' } : {}),
+      });
+    }
+  });
+
+  /**
+   * POST /resdiary/customer-note/replace — change or remove ONE line of a
+   * diner's comments.
+   *
+   * Body: { customerId, previousText, newText? }   // newText null/absent = remove
+   *
+   * The append route can only add. This is what makes a note in the app
+   * editable and deletable in the diary — and it is the dangerous one, because
+   * the Comments field is shared with restaurant staff who type into the
+   * ResDiary portal and have no idea this app exists.
+   *
+   * ── The one rule ──────────────────────────────────────────────────────
+   * The only bytes changed are bytes proved to be there, matched WHOLE-LINE,
+   * in the blob ResDiary handed back milliseconds earlier. Everything else is
+   * copied verbatim. Zero matches and two matches both write NOTHING — they
+   * are answers, not errors: the line has been reworded, or the same words
+   * appear twice and choosing between them is not ours to do.
+   *
+   * ── Why it lives here and not in the app ──────────────────────────────
+   * There is no ETag, RowVersion or Last-Modified on a ResDiary customer, so
+   * the read-write window cannot be closed — only made small. Read and write
+   * back to back in one handler is ~300ms; the app doing it across two network
+   * hops is seconds, and that window is exactly when a manager's portal edit
+   * gets destroyed. `withCustomerLock` then stops us racing ourselves: two
+   * notes actioned from one guest profile would otherwise interleave as
+   * read-A, read-B, write-A, write-B, and write-B — computed from a blob that
+   * predates write-A — would silently reinstate the line write-A removed.
+   *
+   * ── Why it never retries ──────────────────────────────────────────────
+   * `rdSend` retries 429/5xx up to four times with a precomputed body. On this
+   * path each retry would re-PUT a blob derived from a read that may now be
+   * minutes stale, so the PUT goes out with maxAttempts 1. A write we cannot
+   * confirm comes back as landed:null, and the caller must ask a human rather
+   * than repeat it — a false negative on a delete removes a line the
+   * restaurant had since re-added.
+   */
+  app.post('/resdiary/customer-note/replace', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    const { customerId, previousText, newText } = req.body || {};
+    if (!customerId || !String(previousText || '').trim()) {
+      return res.status(400).json({ error: 'expected { customerId, previousText, newText? }' });
+    }
+    const removing = newText === undefined || newText === null || String(newText).trim() === '';
+    const target = removing ? null : String(newText).trim();
+    const needle = String(previousText);
+
+    try {
+      return await withCustomerLock(customerId, async () => {
+        // 1. Read. The blob we splice is the one ResDiary has right now, never
+        //    our mirror — the mirror can be days old.
+        let before;
+        try {
+          before = await rd.getCustomerById(customerId, site);
+        } catch (err) {
+          return res.status(502).json({
+            error: `could not read customer ${customerId}: ${err.message}`,
+            hint: 'Update Customer replaces the whole record, so it is not safe to write without reading first.',
+          });
+        }
+        if (!before || typeof before !== 'object' || !before.Id) {
+          return res.status(404).json({ reason: 'customer_not_found', error: `customer ${customerId} not found` });
+        }
+
+        const blob = typeof before.Comments === 'string' ? before.Comments : '';
+        const hits = findBlockOnBoundary(blob, needle);
+
+        // 2. Refuse rather than guess. Both of these write nothing at all.
+        if (hits.length === 0) {
+          return res.status(200).json({
+            ok: false,
+            reason: 'not_found',
+            customerId,
+            commentsBefore: blob,
+            note: 'That line is not in the diner\'s comments as we last saw it — someone changed it in ResDiary. Nothing was written.',
+          });
+        }
+        if (hits.length > 1) {
+          return res.status(409).json({
+            ok: false,
+            reason: 'ambiguous',
+            occurrences: hits.length,
+            customerId,
+            commentsBefore: blob,
+            note: 'Those words appear more than once on this diner, so which one to change is not ours to guess. Nothing was written.',
+          });
+        }
+
+        // 3. Surgery on the string we just read, then the whole record back.
+        const spliced = spliceBlock(blob, hits[0], target);
+        const form = customerFormFrom(before, { comments: spliced });
+        const put = await rd.rdSend(
+          'PUT',
+          `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Customer/${encodeURIComponent(customerId)}/`,
+          form,
+          { maxAttempts: 1 },
+        );
+
+        if (!put.ok) {
+          return res.status(502).json({
+            ok: false, reason: 'refused',
+            error: `ResDiary refused the write (HTTP ${put.status})`,
+            status: put.status, body: put.body, commentsBefore: blob,
+          });
+        }
+
+        // 4. Judge it with the same matcher that cut it.
+        const after = typeof put.body?.Comments === 'string' ? put.body.Comments : null;
+        const landed = verifySplice(after, needle, target);
+        return res.json({
+          ok: landed === true,
+          action: removing ? 'deleted' : 'edited',
+          customerId,
+          landed,
+          commentsBefore: blob,
+          commentsAfter: after,
+          droppedFields: unsentScalarKeys(before, form),
+          ...(landed === null
+            ? { note: 'The write returned 200 but echoed no Comments, so what happened cannot be told from here. Do NOT retry — open the diner in ResDiary and look.' }
+            : {}),
+        });
       });
     } catch (err) {
       const blocked = err instanceof rd.CloudflareBlockedError;
@@ -728,10 +925,64 @@ function registerResdiaryRoutes(app) {
               IsVip: true,
             }));
 
+          // ── Does omitting AppendComments actually REPLACE? ─────────
+          // Everything about editing and deleting a note rests on this one
+          // answer, and it has never been tested — the append path only ever
+          // proved that the flag ADDS. If replacing silently appends instead,
+          // then a "delete" would append the surviving lines and double every
+          // note on the diner, so nothing may ship until this says so.
+          //
+          // The key is OMITTED, never sent as false: rdSend stringifies false
+          // to "false" through URLSearchParams, and what a vendor's model
+          // binder does with that is a guess.
+          const replaced = await step('replaceNote', () =>
+            rd.rdSend('PUT', `${base}/Customer/${customerId}/`,
+              customerFormFrom(b, { comments: 'probe: replacement' }), { maxAttempts: 1 }));
+
+          const afterReplace = typeof replaced?.body?.Comments === 'string' ? replaced.body.Comments : null;
+          const replaceVerdict =
+            afterReplace === null ? 'UNDETERMINED_NO_BODY'
+            : afterReplace.includes('appended note') || afterReplace.includes('first note') ? 'REPLACE_STILL_APPENDS'
+            : afterReplace.includes('replacement') ? 'REPLACE_WORKS'
+            : 'REPLACE_IGNORED';
+
+          // ── And can the field be emptied at all? ───────────────────────
+          // "Delete the last remaining line" ends in an empty Comments. MEWS
+          // ignores an empty string on its own notes field and needs a single
+          // space; that is a MEWS fact and says nothing about ResDiary, so ask.
+          const cleared = replaceVerdict === 'REPLACE_WORKS'
+            ? await step('clearComments', () =>
+                rd.rdSend('PUT', `${base}/Customer/${customerId}/`,
+                  customerFormFrom(b, { comments: '' }), { maxAttempts: 1 }))
+            : null;
+          const afterClear = typeof cleared?.body?.Comments === 'string' ? cleared.body.Comments : null;
+          const clearVerdict =
+            cleared === null ? 'NOT_ATTEMPTED'
+            : afterClear === null ? 'UNDETERMINED_NO_BODY'
+            : afterClear.trim() === '' ? 'CLEAR_WORKS'
+            : 'CLEAR_IGNORED';
+
+          // Which fields the GET returned that our PUT could not carry. The
+          // hand-picked ten-field form was clearing everything outside it on
+          // every real diner we appended to; this is how we find out.
+          const probeForm = customerFormFrom(b, { comments: 'probe: replacement' });
+
           payload = {
             ok: true,
             customerId,
             ...verdictOf(appended),
+            replace: {
+              verdict: replaceVerdict,
+              commentsAfter: afterReplace,
+              note: replaceVerdict === 'REPLACE_WORKS'
+                ? 'Omitting CustomerOptions[AppendComments] replaces the field — editing and deleting a single note is possible.'
+                : 'Editing and deleting a note is NOT possible this way. Leave diary lines read-only and say why.',
+            },
+            clear: { verdict: clearVerdict, commentsAfter: afterClear },
+            form: {
+              sentKeys: Object.keys(probeForm),
+              droppedFields: unsentScalarKeys(b, probeForm),
+            },
             // Reported separately from the note verdict: VIP is a different
             // question and a different answer is perfectly possible.
             vip: {

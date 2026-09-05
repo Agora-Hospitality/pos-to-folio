@@ -1,0 +1,24 @@
+# Railway deploy config, in git so it is reviewable.
+
+[deploy]
+# Run node DIRECTLY — not `npm start`.
+#
+# With `npm start` npm is PID 1. On every redeploy Railway sends SIGTERM to
+# PID 1; npm takes the signal, never forwards it to `sh -c node src/index.js`,
+# and exits with a signal status. Two consequences, both seen on 04-09-2026:
+#
+#   1. Railway classifies the OUTGOING container as CRASHED and emails
+#      "Deployment crashed for pos-to-folio" — one per deploy. #24→#28 that
+#      afternoon produced a run of them while the bridge was perfectly healthy.
+#   2. The graceful shutdown() at src/index.js:246 never ran. It logs
+#      "SIGTERM received, shutting down..." before stopPolling() and the timer
+#      cleanup; that line appears ZERO times across every replaced deployment,
+#      so the bridge was hard-killed mid-poll each time instead of closing down.
+#
+# node as PID 1 receives the signal itself and the existing handler works.
+startCommand = "node src/index.js"
+
+# Mirrored from the dashboard so nothing silently reverts to a default.
+healthcheckPath = "/health"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
