@@ -968,6 +968,109 @@ function registerResdiaryRoutes(app) {
   });
 
   /**
+   * POST /resdiary/booking-note — set the note on ONE table booking.
+   *
+   * Body: { reference, note }   // note "" or null clears it
+   *
+   * This is the note the restaurant actually reads at the pass — "Birthday,
+   * candle on the dessert", "allergic to ginger". 2,581 of our 12,696 real
+   * bookings carry one.
+   *
+   * ── Proven live 05-09-2026 ────────────────────────────────────────────
+   * `PUT /api/ConsumerApi/v1/Restaurant/{site}/Booking/{REFERENCE}` with the
+   * whole record as raw JSON and `SpecialRequests` changed → 200, and the value
+   * reads back changed. Established by `/resdiary/booking-note-probe` on a
+   * cancelled booking, restored afterwards.
+   *
+   * Three things that took a probe to learn, each of which would be a bug if
+   * assumed:
+   *   • It keys on the booking REFERENCE ("B4CJVLKW"). `GET .../Booking/{id}`
+   *     with the numeric id throws.
+   *   • It takes JSON, not the form encoding every customer endpoint uses —
+   *     a form body answers 400 "The 'request' parameter must be specified".
+   *   • It is a WHOLE-RECORD replace, like the customer PUT. Covers, tables,
+   *     status and the diner all have to be echoed back or they are lost, so
+   *     the read is not optional and there is no "send what we think it is".
+   *
+   * And the field is `SpecialRequests`, not `Comments` — the payload carries
+   * both, and this is the one that sticks. On the EPOS product the same idea
+   * answers 200 and silently ignores the note (sandbox probe, 03-09-2026),
+   * which is why the answer is read back rather than inferred from a status.
+   */
+  app.post('/resdiary/booking-note', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    const { reference, note } = req.body || {};
+    const ref = String(reference || '').trim();
+    if (!ref) return res.status(400).json({ error: 'expected { reference, note }' });
+    const target = note === undefined || note === null ? '' : String(note).trim().slice(0, 2000);
+
+    const path = `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Booking/${encodeURIComponent(ref)}`;
+
+    try {
+      // Serialised per booking for the same reason customers are: two edits in
+      // flight would each PUT a whole record computed before the other landed.
+      return await withCustomerLock(`booking:${ref}`, async () => {
+        let before;
+        try {
+          before = await rd.rdGet(path);
+        } catch (err) {
+          return res.status(502).json({
+            error: `could not read booking ${ref}: ${err.message}`,
+            hint: 'The booking PUT replaces the whole record, so it is not safe to write without reading first.',
+          });
+        }
+        if (!before || typeof before !== 'object' || !before.Reference) {
+          return res.status(404).json({ reason: 'booking_not_found', error: `booking ${ref} not found` });
+        }
+
+        const previous = typeof before.SpecialRequests === 'string' ? before.SpecialRequests : null;
+        if ((previous ?? '') === target) {
+          return res.json({ ok: true, landed: true, reference: ref, unchanged: true, before: previous, after: previous });
+        }
+
+        const put = await rd.rdSendJson('PUT', path, { ...before, SpecialRequests: target });
+        if (!put.ok) {
+          return res.status(502).json({
+            ok: false, reason: 'refused',
+            error: `ResDiary refused the write (HTTP ${put.status})`,
+            status: put.status, body: put.body, before: previous,
+          });
+        }
+
+        // Read it BACK. A 200 is not the answer — the EPOS booking update
+        // returns 200 and ignores the note while applying other fields in the
+        // same payload, and a status that lies is worse than an error.
+        let after = null;
+        try {
+          const fresh = await rd.rdGet(path);
+          after = typeof fresh?.SpecialRequests === 'string' ? fresh.SpecialRequests : null;
+        } catch {
+          return res.json({
+            ok: false, landed: null, reference: ref, before: previous,
+            note: 'The write returned 200 but the booking could not be read back, so what happened cannot be told from here. Do NOT retry — open the booking in ResDiary and look.',
+          });
+        }
+
+        const landed = (after ?? '') === target;
+        return res.json({
+          ok: landed, landed, reference: ref, before: previous, after,
+          ...(landed ? {} : { note: 'ResDiary accepted the write but the note did not change — check the booking in ResDiary before trusting it.' }),
+        });
+      });
+    } catch (err) {
+      const blocked = err instanceof rd.CloudflareBlockedError;
+      return res.status(blocked ? 502 : 500).json({
+        error: err.message,
+        ...(blocked ? { hint: 'This egress IP is not whitelisted by ResDiary.' } : {}),
+      });
+    }
+  });
+
+  /**
    * POST /resdiary/booking-write-probe — is a booking's note writable AT ALL?
    *
    * Body: { reference, bookingId }  — a REAL booking, ideally cancelled.
