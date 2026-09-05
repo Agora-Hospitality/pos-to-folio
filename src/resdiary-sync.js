@@ -925,35 +925,58 @@ function registerResdiaryRoutes(app) {
               IsVip: true,
             }));
 
-          // ── Does omitting AppendComments actually REPLACE? ─────────
-          // Everything about editing and deleting a note rests on this one
-          // answer, and it has never been tested — the append path only ever
-          // proved that the flag ADDS. If replacing silently appends instead,
-          // then a "delete" would append the surviving lines and double every
-          // note on the diner, so nothing may ship until this says so.
+          // ── Can Comments be REPLACED at all, by any spelling? ──────────
           //
-          // The key is OMITTED, never sent as false: rdSend stringifies false
-          // to "false" through URLSearchParams, and what a vendor's model
-          // binder does with that is a guess.
-          const replaced = await step('replaceNote', () =>
-            rd.rdSend('PUT', `${base}/Customer/${customerId}/`,
-              customerFormFrom(b, { comments: 'probe: replacement' }), { maxAttempts: 1 }));
+          // Everything about editing and deleting a note rests on this. Round
+          // one omitted `CustomerOptions[AppendComments]` entirely and ResDiary
+          // APPENDED anyway (probe 05-09-2026), which kills the feature as
+          // designed — so this asks the question every remaining way rather
+          // than concluding "impossible" from one spelling. That mistake has
+          // already been made once on this API: Reviews was declared
+          // unentitled after a 404 that turned out to be our own invented
+          // query parameters.
+          //
+          // Sequenced on the SAME throwaway customer, each attempt reading the
+          // echoed Comments back: if the field grew, that spelling appends; if
+          // it is exactly what we sent, that spelling replaces.
+          const REPLACE_ATTEMPTS = [
+            { name: 'omit', extra: {} },
+            { name: 'bracketFalse', extra: { 'CustomerOptions[AppendComments]': false } },
+            { name: 'dottedFalse', extra: { 'CustomerOptions.AppendComments': false } },
+            { name: 'bareFalse', extra: { AppendComments: false } },
+            { name: 'bracketZero', extra: { 'CustomerOptions[AppendComments]': 0 } },
+          ];
 
-          const afterReplace = typeof replaced?.body?.Comments === 'string' ? replaced.body.Comments : null;
-          const replaceVerdict =
-            afterReplace === null ? 'UNDETERMINED_NO_BODY'
-            : afterReplace.includes('appended note') || afterReplace.includes('first note') ? 'REPLACE_STILL_APPENDS'
-            : afterReplace.includes('replacement') ? 'REPLACE_WORKS'
-            : 'REPLACE_IGNORED';
+          const replaceTries = [];
+          let replaceWinner = null;
+          for (const attempt of REPLACE_ATTEMPTS) {
+            const marker = `probe: replace-${attempt.name}`;
+            const r = await step(`replace:${attempt.name}`, () =>
+              rd.rdSend('PUT', `${base}/Customer/${customerId}/`,
+                { ...customerFormFrom(b, { comments: marker }), ...attempt.extra },
+                { maxAttempts: 1 }));
+            const after = typeof r?.body?.Comments === 'string' ? r.body.Comments : null;
+            const verdict =
+              after === null ? 'UNDETERMINED_NO_BODY'
+              : after.trim() === marker ? 'REPLACES'
+              : after.includes(marker) ? 'APPENDS'
+              : 'IGNORED';
+            replaceTries.push({ attempt: attempt.name, verdict, commentsAfter: after });
+            if (verdict === 'REPLACES') { replaceWinner = attempt; break; }
+          }
+
+          const replaceVerdict = replaceWinner ? 'REPLACE_WORKS'
+            : replaceTries.some((t) => t.verdict === 'APPENDS') ? 'REPLACE_STILL_APPENDS'
+            : 'UNDETERMINED';
 
           // ── And can the field be emptied at all? ───────────────────────
           // "Delete the last remaining line" ends in an empty Comments. MEWS
           // ignores an empty string on its own notes field and needs a single
           // space; that is a MEWS fact and says nothing about ResDiary, so ask.
-          const cleared = replaceVerdict === 'REPLACE_WORKS'
+          const cleared = replaceWinner
             ? await step('clearComments', () =>
                 rd.rdSend('PUT', `${base}/Customer/${customerId}/`,
-                  customerFormFrom(b, { comments: '' }), { maxAttempts: 1 }))
+                  { ...customerFormFrom(b, { comments: '' }), ...replaceWinner.extra }, { maxAttempts: 1 }))
             : null;
           const afterClear = typeof cleared?.body?.Comments === 'string' ? cleared.body.Comments : null;
           const clearVerdict =
@@ -961,6 +984,24 @@ function registerResdiaryRoutes(app) {
             : afterClear === null ? 'UNDETERMINED_NO_BODY'
             : afterClear.trim() === '' ? 'CLEAR_WORKS'
             : 'CLEAR_IGNORED';
+
+          // ── Does the PUT carry a nested Address? ───────────────────────
+          // Round one reported Address and CustomerCodes as dropped, and the
+          // PUT replaces the whole record — so every note we have ever
+          // appended to a real diner has been blanking their address. Ask
+          // whether the bracket notation that works for CustomerOptions works
+          // here too, so it can be carried instead of lost.
+          const addressTry = await step('addressBracket', () =>
+            rd.rdSend('PUT', `${base}/Customer/${customerId}/`, {
+              ...customerFormFrom(b, { comments: 'probe: address' }),
+              'Address[Town]': 'ProbeTown',
+              'Address[Street]': 'Probe Street',
+            }, { maxAttempts: 1 }));
+          const addressAfter = addressTry?.body?.Address ?? null;
+          const addressVerdict =
+            !addressAfter ? 'UNDETERMINED_NO_BODY'
+            : addressAfter.Town === 'ProbeTown' ? 'ADDRESS_BRACKET_WORKS'
+            : 'ADDRESS_NOT_CARRIED';
 
           // Which fields the GET returned that our PUT could not carry. The
           // hand-picked ten-field form was clearing everything outside it on
@@ -973,11 +1014,13 @@ function registerResdiaryRoutes(app) {
             ...verdictOf(appended),
             replace: {
               verdict: replaceVerdict,
-              commentsAfter: afterReplace,
-              note: replaceVerdict === 'REPLACE_WORKS'
-                ? 'Omitting CustomerOptions[AppendComments] replaces the field — editing and deleting a single note is possible.'
-                : 'Editing and deleting a note is NOT possible this way. Leave diary lines read-only and say why.',
+              worksVia: replaceWinner ? replaceWinner.name : null,
+              tried: replaceTries,
+              note: replaceWinner
+                ? `Comments CAN be replaced, via "${replaceWinner.name}" — editing and deleting a single note is possible.`
+                : 'Comments is APPEND-ONLY by every spelling tried. Editing and deleting a diary line is not possible through this endpoint.',
             },
+            address: { verdict: addressVerdict, after: addressAfter },
             clear: { verdict: clearVerdict, commentsAfter: afterClear },
             form: {
               sentKeys: Object.keys(probeForm),
