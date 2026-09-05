@@ -168,8 +168,32 @@ function customerFormFrom(before, changes = {}) {
     const t = typeof v;
     if (t === 'string' || t === 'number' || t === 'boolean') form[k] = v;
   }
+
+  // The nested Address, in the bracket notation the API actually accepts —
+  // proven live 05-09-2026: sending `Address[Town]` came back as the diner's
+  // Town. Before this it was dropped on every write, and because the PUT
+  // replaces the whole record, every note we appended BLANKED the customer's
+  // address. Six fields, each only sent when the GET gave us one, so a diner
+  // with no address is not handed six empty strings.
+  const addr = b.Address && typeof b.Address === 'object' ? b.Address : null;
+  if (addr) {
+    for (const key of ['House', 'Street', 'Town', 'Postcode', 'CountyRegion', 'Country']) {
+      const v = addr[key];
+      if (typeof v === 'string' && v !== '') form[`Address[${key}]`] = v;
+    }
+  }
+
   if (changes.comments !== undefined) form.Comments = changes.comments;
-  if (changes.appendComments) form['CustomerOptions[AppendComments]'] = true;
+  // ── The flag is ALWAYS sent, and its value is the whole question ─────────
+  // Omitting it does NOT mean "replace" — ResDiary defaults to appending, so
+  // an omitted key silently appends (probe, 05-09-2026, verdict APPENDS).
+  // Sending it explicitly false is what replaces the field. The earlier
+  // reasoning here — "omit rather than send false, a stringified false is a
+  // guess" — was exactly backwards and would have made edit and delete
+  // impossible while looking like a vendor limitation.
+  if (changes.appendComments !== undefined) {
+    form['CustomerOptions[AppendComments]'] = changes.appendComments === true;
+  }
   if (changes.vip !== undefined) form.IsVip = changes.vip;
   return form;
 }
@@ -182,7 +206,12 @@ function unsentScalarKeys(before, form) {
     const v = b[k];
     if (v === null || v === undefined) return false;
     const t = typeof v;
-    return (t !== 'string' && t !== 'number' && t !== 'boolean') && !(k in form);
+    if (t === 'string' || t === 'number' || t === 'boolean') return false;
+    if (k in form) return false;
+    // Address is carried field by field in bracket notation, so it is not lost
+    // even though the key itself never appears in the form.
+    if (k === 'Address' && Object.keys(form).some((f) => f.startsWith('Address['))) return false;
+    return true;
   });
 }
 
@@ -794,7 +823,10 @@ function registerResdiaryRoutes(app) {
 
         // 3. Surgery on the string we just read, then the whole record back.
         const spliced = spliceBlock(blob, hits[0], target);
-        const form = customerFormFrom(before, { comments: spliced });
+        // appendComments FALSE — the flag is what makes this a replace. Omitted,
+        // ResDiary appends and the splice would double the blob instead of
+        // rewriting it.
+        const form = customerFormFrom(before, { comments: spliced, appendComments: false });
         const put = await rd.rdSend(
           'PUT',
           `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Customer/${encodeURIComponent(customerId)}/`,
@@ -811,7 +843,14 @@ function registerResdiaryRoutes(app) {
         }
 
         // 4. Judge it with the same matcher that cut it.
-        const after = typeof put.body?.Comments === 'string' ? put.body.Comments : null;
+        // A CLEARED Comments comes back as null rather than "" — so on a delete
+        // that empties the field, null is the SUCCESS answer, not the
+        // unreadable-body answer. Distinguishing them matters: treating a
+        // successful clear as undetermined would tell staff to go and check a
+        // diner that is already correct.
+        const raw = put.body?.Comments;
+        const emptied = raw === null && removing;
+        const after = typeof raw === 'string' ? raw : emptied ? '' : null;
         const landed = verifySplice(after, needle, target);
         return res.json({
           ok: landed === true,
@@ -978,7 +1017,10 @@ function registerResdiaryRoutes(app) {
                 rd.rdSend('PUT', `${base}/Customer/${customerId}/`,
                   { ...customerFormFrom(b, { comments: '' }), ...replaceWinner.extra }, { maxAttempts: 1 }))
             : null;
-          const afterClear = typeof cleared?.body?.Comments === 'string' ? cleared.body.Comments : null;
+          // An emptied Comments comes back as null, not "" — so null here is
+          // the SUCCESS answer, not an unreadable body.
+          const rawClear = cleared?.body?.Comments;
+          const afterClear = typeof rawClear === 'string' ? rawClear : rawClear === null ? '' : null;
           const clearVerdict =
             cleared === null ? 'NOT_ATTEMPTED'
             : afterClear === null ? 'UNDETERMINED_NO_BODY'
