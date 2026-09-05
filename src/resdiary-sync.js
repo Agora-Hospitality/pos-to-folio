@@ -967,6 +967,87 @@ function registerResdiaryRoutes(app) {
     }
   });
 
+  /**
+   * POST /resdiary/booking-write-probe — is a booking's note writable AT ALL?
+   *
+   * Body: { reference, bookingId }  — a REAL booking, ideally cancelled.
+   *
+   * ── What is already settled, so this does not re-ask it ────────────────
+   * On the EPOS product (03-09-2026, sandbox): `PUT {EPOS}/Restaurant/{id}/
+   * Booking/{id}` exists and APPLIES changes — Covers 2→3 landed — but
+   * `Comments` is silently ignored on that same call, and
+   * `PUT …/Booking/{id}/Comments` is a 404. So EPOS cannot write the note.
+   *
+   * The CONSUMER API's booking-update path has never been tested, and that is
+   * the whole question here. It is the product that turned out to carry the
+   * CUSTOMER note write after the docs implied otherwise, so "one product
+   * refuses" is not an answer about the other.
+   *
+   * ── Why this writes nothing ────────────────────────────────────────────
+   * Every attempt sends an EMPTY body. On a whole-record endpoint that fails
+   * validation before anything is applied — which is precisely how the EPOS
+   * probe identified the route (400 with a ValidationErrors array naming
+   * Covers and Tables). So the answers available are:
+   *   404 → no such route          405 → wrong verb for a route that exists
+   *   400 → ROUTE EXISTS, body rejected (the signal we want)
+   *   403 → route exists, not entitled
+   * A real reference is required for the same reason: a made-up one answers
+   * 404 for "no such booking", which is indistinguishable from "no such route"
+   * — the exact ambiguity that cost a month on Reviews.
+   */
+  app.post('/resdiary/booking-write-probe', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    const { reference, bookingId } = req.body || {};
+    if (!reference && !bookingId) return res.status(400).json({ error: 'expected { reference, bookingId } — a REAL booking' });
+
+    const base = `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}`;
+    const keys = [
+      ...(reference ? [{ kind: 'reference', value: String(reference) }] : []),
+      ...(bookingId ? [{ kind: 'bookingId', value: String(bookingId) }] : []),
+    ];
+
+    const attempts = [];
+    for (const key of keys) {
+      const k = encodeURIComponent(key.value);
+      const candidates = [
+        { method: 'GET',   path: `${base}/Booking/${k}` },
+        { method: 'PUT',   path: `${base}/Booking/${k}` },
+        { method: 'PATCH', path: `${base}/Booking/${k}` },
+        { method: 'POST',  path: `${base}/Booking/${k}` },
+        { method: 'PUT',   path: `${base}/Booking/${k}/Comments` },
+        { method: 'POST',  path: `${base}/Booking/${k}/Comment` },
+        { method: 'PUT',   path: `${base}/BookingReference/${k}` },
+      ];
+      for (const c of candidates) {
+        try {
+          // Empty body throughout — nothing here can apply a change.
+          const r = c.method === 'GET'
+            ? await rd.rdGet(c.path).then((body) => ({ status: 200, body }), (err) => ({ status: err?.status ?? 0, body: err?.message }))
+            : await rd.rdSend(c.method, c.path, {}, { maxAttempts: 1 });
+          const body = typeof r.body === 'string' ? r.body.slice(0, 220) : JSON.stringify(r.body ?? null).slice(0, 220);
+          attempts.push({ key: key.kind, method: c.method, path: c.path.replace(base, ''), status: r.status, body });
+        } catch (err) {
+          attempts.push({ key: key.kind, method: c.method, path: c.path.replace(base, ''), status: null, body: String(err.message).slice(0, 160) });
+        }
+      }
+    }
+
+    const routeExists = attempts.filter((a) => a.status === 400 || a.status === 200);
+    return res.json({
+      site,
+      verdict: routeExists.length ? 'ROUTE_CANDIDATES_FOUND' : 'NO_ROUTE_RESPONDED',
+      note: routeExists.length
+        ? 'A 400 or 200 means the route EXISTS. Read the bodies: a validation list names what a real write must send.'
+        : 'Every candidate answered 404/405 — the Consumer API has no booking-update path under these spellings.',
+      routeExists,
+      attempts,
+    });
+  });
+
   app.post('/resdiary/customer-note-probe', async (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });

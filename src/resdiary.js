@@ -436,6 +436,10 @@ module.exports = {
   hasCreds,
   isConfigured,
   getToken,
+  // Exported for probing only. Route DISCOVERY needs a raw GET at an arbitrary
+  // path — every named helper above already assumes it knows the path, which is
+  // the assumption a probe exists to test.
+  rdGet,
   getCurrentUser,
   getRestaurants,
   getReviews,
