@@ -829,6 +829,12 @@ function registerResdiaryRoutes(app) {
       if (!cust || typeof cust !== 'object' || !cust.Id) {
         return res.status(404).json({ error: `customer ${req.params.id} not found` });
       }
+      // ?comments=1 — just the comments box. What the app needs before it
+      // decides which of a guest's notes are in the diary; the whole record is
+      // a diner's personal data and there is no reason to move it for that.
+      if (req.query.comments) {
+        return res.json({ id: cust.Id, comments: typeof cust.Comments === 'string' ? cust.Comments : null });
+      }
       if (req.query.fields) {
         const shape = {};
         for (const [k, v] of Object.entries(cust)) {
@@ -964,6 +970,85 @@ function registerResdiaryRoutes(app) {
         error: err.message,
         ...(blocked ? { hint: 'This egress IP is not whitelisted by ResDiary.' } : {}),
       });
+    }
+  });
+
+  /**
+   * POST /resdiary/customer-vip — mark a diner VIP in the diary.
+   *
+   * Body: { customerId, vip: true }
+   *
+   * ── Upgrade only, and that is a decision, not a limitation ─────────────
+   * `IsVip` is writable (probe 04-09-2026), but our VIP flag and ResDiary's are
+   * not the same fact. Ours is DERIVED from MEWS classifications; the
+   * restaurant sets theirs on the floor, for reasons that never reach this app
+   * — a regular the manager knows, somebody's family. Mirroring ours onto
+   * theirs in both directions would strip those the first time a guest fell
+   * below our threshold, silently, on a record we do not own.
+   *
+   * So `vip: false` is REFUSED rather than honoured. Marking someone VIP is
+   * additive and safe; un-marking is the restaurant's to do, in ResDiary.
+   */
+  app.post('/resdiary/customer-vip', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    const { customerId, vip } = req.body || {};
+    if (!customerId) return res.status(400).json({ error: 'expected { customerId, vip: true }' });
+    if (vip !== true) {
+      return res.status(400).json({
+        error: 'only vip:true is accepted — un-marking a VIP is the restaurant\'s to do in ResDiary',
+        reason: 'upgrade_only',
+      });
+    }
+
+    try {
+      return await withCustomerLock(customerId, async () => {
+        let before;
+        try {
+          before = await rd.getCustomerById(customerId, site);
+        } catch (err) {
+          return res.status(502).json({ error: `could not read customer ${customerId}: ${err.message}` });
+        }
+        if (!before || typeof before !== 'object' || !before.Id) {
+          return res.status(404).json({ error: `customer ${customerId} not found` });
+        }
+        const unpreservable = unpreservableFields(before);
+        if (unpreservable.length) {
+          return res.status(409).json({
+            ok: false, reason: 'would_clear_fields', fields: unpreservable, customerId,
+            error: `This diner carries ${unpreservable.join(', ')}, which this API gives us no way to send back — the write would erase it. Nothing was written.`,
+          });
+        }
+        if (before.IsVip === true) {
+          return res.json({ ok: true, landed: true, customerId, unchanged: true, vipAfter: true });
+        }
+
+        // The comments must ride along untouched: this is a whole-record PUT,
+        // and appendComments false with the EXISTING text rewrites it as-is
+        // rather than appending a duplicate of it.
+        const form = customerFormFrom(before, {
+          comments: typeof before.Comments === 'string' ? before.Comments : '',
+          appendComments: false,
+          vip: true,
+        });
+        const put = await rd.rdSend('PUT', `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Customer/${encodeURIComponent(customerId)}/`, form, { maxAttempts: 1 });
+        if (!put.ok) {
+          return res.status(502).json({ ok: false, reason: 'refused', error: `ResDiary refused the write (HTTP ${put.status})`, status: put.status, body: put.body });
+        }
+        const after = put.body?.IsVip;
+        const landed = after === true ? true : after === false ? false : null;
+        return res.json({
+          ok: landed === true, landed, customerId, vipAfter: after ?? null,
+          commentsAfter: put.body?.Comments ?? null,
+          ...(landed === null ? { note: 'The write returned 200 but echoed no IsVip — check the diner in ResDiary.' } : {}),
+        });
+      });
+    } catch (err) {
+      const blocked = err instanceof rd.CloudflareBlockedError;
+      return res.status(blocked ? 502 : 500).json({ error: err.message, ...(blocked ? { hint: 'This egress IP is not whitelisted by ResDiary.' } : {}) });
     }
   });
 
