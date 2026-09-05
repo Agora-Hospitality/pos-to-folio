@@ -978,16 +978,21 @@ function registerResdiaryRoutes(app) {
    *
    * Body: { customerId, vip: true }
    *
-   * ── Upgrade only, and that is a decision, not a limitation ─────────────
-   * `IsVip` is writable (probe 04-09-2026), but our VIP flag and ResDiary's are
-   * not the same fact. Ours is DERIVED from MEWS classifications; the
-   * restaurant sets theirs on the floor, for reasons that never reach this app
-   * — a regular the manager knows, somebody's family. Mirroring ours onto
-   * theirs in both directions would strip those the first time a guest fell
-   * below our threshold, silently, on a record we do not own.
+   * ── Both directions, on the owner's instruction ────────────────────────
+   * "if its a vip it should be a vip in all 3 app/resd/mews and the opposite."
+   * So `false` is honoured as well as `true`; the app is the authority and the
+   * diary is brought into line with it.
    *
-   * So `vip: false` is REFUSED rather than honoured. Marking someone VIP is
-   * additive and safe; un-marking is the restaurant's to do, in ResDiary.
+   * This was upgrade-only for a day, on the reasoning that the restaurant sets
+   * its own VIPs for reasons that never reach the app. That reasoning was
+   * sound and the conclusion was still wrong: it left "not a VIP" unachievable,
+   * which is half of what was asked for.
+   *
+   * The protection that actually matters is not refusing the write — it is
+   * recording it. The app stores `vipWritten` per diner, so a mark WE set is
+   * never read back as the restaurant's own evidence. Without that the write
+   * would loop: our star returns through booking ingest, re-asserts our own
+   * flag, and nobody could be un-starred again.
    */
   app.post('/resdiary/customer-vip', async (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
@@ -997,11 +1002,8 @@ function registerResdiaryRoutes(app) {
 
     const { customerId, vip } = req.body || {};
     if (!customerId) return res.status(400).json({ error: 'expected { customerId, vip: true }' });
-    if (vip !== true) {
-      return res.status(400).json({
-        error: 'only vip:true is accepted — un-marking a VIP is the restaurant\'s to do in ResDiary',
-        reason: 'upgrade_only',
-      });
+    if (typeof vip !== 'boolean') {
+      return res.status(400).json({ error: 'expected { customerId, vip: boolean }' });
     }
 
     try {
@@ -1022,8 +1024,8 @@ function registerResdiaryRoutes(app) {
             error: `This diner carries ${unpreservable.join(', ')}, which this API gives us no way to send back — the write would erase it. Nothing was written.`,
           });
         }
-        if (before.IsVip === true) {
-          return res.json({ ok: true, landed: true, customerId, unchanged: true, vipAfter: true });
+        if (before.IsVip === vip) {
+          return res.json({ ok: true, landed: true, customerId, unchanged: true, vipAfter: vip });
         }
 
         // The comments must ride along untouched: this is a whole-record PUT,
@@ -1032,14 +1034,14 @@ function registerResdiaryRoutes(app) {
         const form = customerFormFrom(before, {
           comments: typeof before.Comments === 'string' ? before.Comments : '',
           appendComments: false,
-          vip: true,
+          vip,
         });
         const put = await rd.rdSend('PUT', `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}/Customer/${encodeURIComponent(customerId)}/`, form, { maxAttempts: 1 });
         if (!put.ok) {
           return res.status(502).json({ ok: false, reason: 'refused', error: `ResDiary refused the write (HTTP ${put.status})`, status: put.status, body: put.body });
         }
         const after = put.body?.IsVip;
-        const landed = after === true ? true : after === false ? false : null;
+        const landed = typeof after === 'boolean' ? after === vip : null;
         return res.json({
           ok: landed === true, landed, customerId, vipAfter: after ?? null,
           commentsAfter: put.body?.Comments ?? null,
