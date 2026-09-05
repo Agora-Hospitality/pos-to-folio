@@ -351,6 +351,65 @@ async function getRestaurants() {
  * note means reading the record first and sending it back with the one field
  * changed — anything omitted is anything lost.
  */
+/**
+ * Like `rdSend`, but JSON.
+ *
+ * The customer endpoints take form-encoded bodies; the BOOKING update does not
+ * — `PUT .../Booking/{reference}` with a form body answers 400 "The 'request'
+ * parameter must be specified with the request", which is ASP.NET saying it
+ * could not bind the body at all. Same auth, same throttle, same
+ * Cloudflare-block detection; only the content type and the retry default
+ * differ.
+ *
+ * maxAttempts defaults to 1 here on purpose. Every JSON write we make is a
+ * read-modify-write of a whole record, and replaying one re-sends a body
+ * computed from a read that may now be stale.
+ */
+async function rdSendJson(method, apiPath, payload, opts = {}) {
+  const maxAttempts = Number.isInteger(opts.maxAttempts) && opts.maxAttempts > 0 ? opts.maxAttempts : 1;
+  const url = new URL(BASE + apiPath);
+  const body = JSON.stringify(payload ?? {});
+
+  let reauthed = false;
+  let lastErr = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) await sleep(1000 * 3 ** (attempt - 1));
+    await throttle();
+    let res, text;
+    try {
+      res = await fetch(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${await getToken()}`,
+          'User-Agent': USER_AGENT,
+          Accept: 'application/json, text/plain, */*',
+          'Content-Type': 'application/json',
+        },
+        body,
+        signal: AbortSignal.timeout(60_000),
+      });
+      text = await res.text();
+    } catch (err) {
+      lastErr = err;
+      continue;
+    }
+
+    if (looksBlocked(res.status, text)) throw new CloudflareBlockedError(res.status, text.slice(0, 120));
+
+    if (res.status === 401 && !reauthed) {
+      reauthed = true;
+      await getToken(true);
+      attempt--;
+      continue;
+    }
+
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text.slice(0, 400); }
+    return { ok: res.ok, status: res.status, body: parsed };
+  }
+  throw lastErr || new Error(`ResDiary ${method} ${apiPath} failed`);
+}
+
 async function getCustomerById(customerId, micrositeName) {
   const site = micrositeName || process.env.RESDIARY_MICROSITE_NAME || '';
   if (!site) throw new Error('RESDIARY_MICROSITE_NAME not set');
@@ -444,6 +503,7 @@ module.exports = {
   getRestaurants,
   getReviews,
   rdSend,
+  rdSendJson,
   micrositeName,
   getCustomerById,
   getEarliestBookingDate,

@@ -1048,6 +1048,112 @@ function registerResdiaryRoutes(app) {
     });
   });
 
+  /**
+   * POST /resdiary/booking-note-probe — can the booking's note be WRITTEN?
+   *
+   * Body: { reference }  — a REAL booking. Use a CANCELLED one with no note.
+   *
+   * Route existence is already settled (`/resdiary/booking-write-probe`):
+   * `PUT .../Booking/{reference}` answers 400 "The 'request' parameter must be
+   * specified", i.e. it exists and wants JSON, and it keys on the REFERENCE —
+   * `GET .../Booking/{bookingId}` throws while the reference reads 200.
+   *
+   * This asks the only remaining question: does a note sent that way STICK?
+   * EPOS answered 200 and silently ignored `Comments` while applying `Covers`
+   * from the same payload, so a 200 here proves nothing on its own — every
+   * attempt is read back and compared.
+   *
+   * Two body shapes are tried because the 400 is ambiguous about which it
+   * wants: the record on its own, and wrapped as `{ request: … }`. And two
+   * field names, because a booking payload carries BOTH `SpecialRequests` and
+   * `Comments` and nothing says which one the diary screen shows.
+   *
+   * Restores the original value in a `finally`, whatever happens.
+   */
+  app.post('/resdiary/booking-note-probe', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    const reference = String((req.body || {}).reference || '').trim();
+    if (!reference) return res.status(400).json({ error: 'expected { reference } — a REAL, ideally cancelled, booking' });
+
+    const base = `/api/ConsumerApi/v1/Restaurant/${encodeURIComponent(site)}`;
+    const path = `${base}/Booking/${encodeURIComponent(reference)}`;
+    const MARKER = `probe-note-${Date.now()}`;
+    const steps = [];
+    let before = null;
+
+    const read = async (label) => {
+      try {
+        const b = await rd.rdGet(path);
+        steps.push({ name: `read:${label}`, ok: true, specialRequests: b?.SpecialRequests ?? null, comments: b?.Comments ?? null });
+        return b;
+      } catch (err) {
+        steps.push({ name: `read:${label}`, ok: false, error: String(err.message).slice(0, 160) });
+        return null;
+      }
+    };
+
+    try {
+      before = await read('before');
+      if (!before) return res.status(502).json({ error: `could not read booking ${reference}` });
+
+      const ATTEMPTS = [
+        { name: 'raw:SpecialRequests', wrap: false, field: 'SpecialRequests' },
+        { name: 'wrapped:SpecialRequests', wrap: true, field: 'SpecialRequests' },
+        { name: 'raw:Comments', wrap: false, field: 'Comments' },
+        { name: 'wrapped:Comments', wrap: true, field: 'Comments' },
+      ];
+
+      let landed = null;
+      for (const a of ATTEMPTS) {
+        const record = { ...before, [a.field]: MARKER };
+        const payload = a.wrap ? { request: record } : record;
+        let put;
+        try {
+          put = await rd.rdSendJson('PUT', path, payload);
+        } catch (err) {
+          steps.push({ name: `put:${a.name}`, ok: false, error: String(err.message).slice(0, 160) });
+          continue;
+        }
+        // A 200 is NOT the answer — EPOS returned 200 and ignored the field.
+        const after = await read(`after:${a.name}`);
+        const stuck = after && (after.SpecialRequests === MARKER || after.Comments === MARKER);
+        steps.push({
+          name: `put:${a.name}`, ok: put.ok, status: put.status, stuck: !!stuck,
+          body: typeof put.body === 'string' ? put.body.slice(0, 200) : JSON.stringify(put.body ?? null).slice(0, 200),
+        });
+        if (stuck) { landed = a; break; }
+      }
+
+      return res.json({
+        reference,
+        verdict: landed ? 'BOOKING_NOTE_WRITABLE' : 'BOOKING_NOTE_NOT_WRITABLE',
+        worksVia: landed ? landed.name : null,
+        note: landed
+          ? `The booking note CAN be written, via ${landed.name}. Read-modify-write the whole record.`
+          : 'Every shape answered without the note sticking — the booking note is not writable on the Consumer API either.',
+        before: { specialRequests: before?.SpecialRequests ?? null, comments: before?.Comments ?? null },
+        steps,
+      });
+    } finally {
+      // Put it back exactly as found, whatever happened above.
+      if (before) {
+        try {
+          await rd.rdSendJson('PUT', path, before);
+          const back = await rd.rdGet(path);
+          console.log('[booking-note-probe] restored', reference, JSON.stringify({
+            specialRequests: back?.SpecialRequests ?? null, comments: back?.Comments ?? null,
+          }));
+        } catch (err) {
+          console.error('[booking-note-probe] RESTORE FAILED', reference, err.message);
+        }
+      }
+    }
+  });
+
   app.post('/resdiary/customer-note-probe', async (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
