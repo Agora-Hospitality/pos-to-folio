@@ -684,9 +684,17 @@ function registerResdiaryRoutes(app) {
       }
 
       // 2. Send it back, with the note appended and nothing else disturbed.
+      //
+      // Appending to an EMPTY box is a plain set, not an append. ResDiary's
+      // append is unconditionally `existing + CRLF + new`, so appending into an
+      // empty Comments yields a leading blank line — every diner's very first
+      // note would start their comments box with one (observed on a real diner,
+      // 05-09-2026). Sending the flag false when there is nothing to append to
+      // writes the note on its own, which is what "add the first note" means.
+      const existingComments = typeof before.Comments === 'string' ? before.Comments : '';
       const form = customerFormFrom(before, {
         comments: String(note).trim(),
-        appendComments: true,
+        appendComments: existingComments.trim() !== '',
         ...(vip === undefined ? {} : { vip }),
       });
 
