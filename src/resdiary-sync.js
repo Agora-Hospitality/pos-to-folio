@@ -773,6 +773,51 @@ function registerResdiaryRoutes(app) {
    * than repeat it — a false negative on a delete removes a line the
    * restaurant had since re-added.
    */
+  /**
+   * GET /resdiary/customer/:id — one diner's record, verbatim.
+   *
+   * Read-only. It exists because the Customer PUT replaces the WHOLE record, so
+   * "what fields does a real diner actually carry, and which of them can our
+   * form carry back" is a question that has to be answerable without writing
+   * anything. The hand-picked ten-field form was silently clearing address,
+   * date of birth and tags on every write until this could be asked.
+   *
+   * ?fields=1 returns only the SHAPE — key names and types, with the values
+   * stripped — so the field inventory can be read without pulling a real
+   * diner's personal data through logs and terminals.
+   */
+  app.get('/resdiary/customer/:id', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
+    const site = rd.micrositeName();
+    if (!site) return res.status(503).json({ error: 'RESDIARY_MICROSITE_NAME not set' });
+
+    try {
+      const cust = await rd.getCustomerById(req.params.id, site);
+      if (!cust || typeof cust !== 'object' || !cust.Id) {
+        return res.status(404).json({ error: `customer ${req.params.id} not found` });
+      }
+      if (req.query.fields) {
+        const shape = {};
+        for (const [k, v] of Object.entries(cust)) {
+          shape[k] = v === null ? 'null'
+            : Array.isArray(v) ? `array[${v.length}]${v.length ? ':' + JSON.stringify(v[0]) : ''}`
+            : typeof v === 'object' ? `object{${Object.keys(v).join(',')}}`
+            : typeof v;
+        }
+        const form = customerFormFrom(cust, { comments: '' });
+        return res.json({ id: cust.Id, shape, formKeys: Object.keys(form), dropped: unsentScalarKeys(cust, form) });
+      }
+      return res.json(cust);
+    } catch (err) {
+      const blocked = err instanceof rd.CloudflareBlockedError;
+      return res.status(blocked ? 502 : 500).json({
+        error: err.message,
+        ...(blocked ? { hint: 'This egress IP is not whitelisted by ResDiary.' } : {}),
+      });
+    }
+  });
+
   app.post('/resdiary/customer-note/replace', async (req, res) => {
     if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
     if (!rd.hasCreds()) return res.status(503).json({ error: 'resdiary_creds_not_configured' });
@@ -1035,6 +1080,35 @@ function registerResdiaryRoutes(app) {
             : afterClear.trim() === '' ? 'CLEAR_WORKS'
             : 'CLEAR_IGNORED';
 
+          // ── And CustomerCodes, the last field the form still drops? ────
+          // An array, so bracket notation alone may not be enough — and unlike
+          // Address, the values are probably a configured list the microsite
+          // owns rather than free text, in which case an invented code is
+          // rejected and the honest answer is "cannot be carried".
+          const CODE_ATTEMPTS = [
+            { name: 'indexBare', extra: { 'CustomerCodes[0]': 'PROBE' } },
+            { name: 'indexCode', extra: { 'CustomerCodes[0][Code]': 'PROBE' } },
+            { name: 'indexName', extra: { 'CustomerCodes[0][Name]': 'PROBE' } },
+            { name: 'bare', extra: { CustomerCodes: 'PROBE' } },
+          ];
+          const codeTries = [];
+          for (const attempt of CODE_ATTEMPTS) {
+            const r = await step(`codes:${attempt.name}`, () =>
+              rd.rdSend('PUT', `${base}/Customer/${customerId}/`, {
+                ...customerFormFrom(b, { comments: 'probe: codes', appendComments: false }),
+                ...attempt.extra,
+              }, { maxAttempts: 1 }));
+            const got = r?.body?.CustomerCodes;
+            codeTries.push({
+              attempt: attempt.name,
+              status: r?.status ?? null,
+              carried: Array.isArray(got) && got.length > 0,
+              got: Array.isArray(got) ? got.slice(0, 2) : got ?? null,
+            });
+            if (Array.isArray(got) && got.length > 0) break;
+          }
+          const codesVerdict = codeTries.some((t) => t.carried) ? 'CODES_CARRIED' : 'CODES_NOT_CARRIED';
+
           // ── Does the PUT carry a nested Address? ───────────────────────
           // Round one reported Address and CustomerCodes as dropped, and the
           // PUT replaces the whole record — so every note we have ever
@@ -1071,6 +1145,7 @@ function registerResdiaryRoutes(app) {
                 : 'Comments is APPEND-ONLY by every spelling tried. Editing and deleting a diary line is not possible through this endpoint.',
             },
             address: { verdict: addressVerdict, after: addressAfter },
+            customerCodes: { verdict: codesVerdict, tried: codeTries },
             clear: { verdict: clearVerdict, commentsAfter: afterClear },
             form: {
               sentKeys: Object.keys(probeForm),
