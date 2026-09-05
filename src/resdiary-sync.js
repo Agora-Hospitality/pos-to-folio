@@ -216,6 +216,30 @@ function unsentScalarKeys(before, form) {
 }
 
 /**
+ * Fields a real diner may carry that our PUT cannot carry back.
+ *
+ * The Customer PUT replaces the WHOLE record, so a field the form cannot send
+ * is a field every write destroys. Address was one until bracket notation was
+ * found (05-09-2026). `CustomerCodes` is the one left: it is an array, no
+ * spelling tried carries it — `CustomerCodes[0]`, `[0][Code]`, `[0][Name]` all
+ * answered 200 and ignored it — and there is no known way to send it.
+ *
+ * Today that costs nothing: 150 of 150 real diners sampled hold an empty
+ * array. But "nobody uses this field yet" is a fact about this month, not about
+ * the API, and the moment someone tags a diner in the ResDiary portal a note
+ * write would silently wipe it.
+ *
+ * So a write REFUSES rather than destroying data it cannot preserve. Fails
+ * closed, costs nothing while the field stays empty, and turns a silent loss
+ * into a message the moment it would matter.
+ */
+function unpreservableFields(before) {
+  const out = [];
+  if (Array.isArray(before?.CustomerCodes) && before.CustomerCodes.length > 0) out.push('CustomerCodes');
+  return out;
+}
+
+/**
  * What the append attempt actually told us.
  *
  * Status BEFORE content. NOT_WRITABLE is reserved for the vendor refusing;
@@ -683,6 +707,14 @@ function registerResdiaryRoutes(app) {
         return res.status(404).json({ error: `customer ${customerId} not found` });
       }
 
+      const unpreservable = unpreservableFields(before);
+      if (unpreservable.length) {
+        return res.status(409).json({
+          ok: false, reason: 'would_clear_fields', fields: unpreservable, customerId,
+          error: `This diner carries ${unpreservable.join(', ')}, which this API gives us no way to send back — writing the note would erase it. Nothing was written. Add the note in ResDiary instead.`,
+        });
+      }
+
       // 2. Send it back, with the note appended and nothing else disturbed.
       //
       // Appending to an EMPTY box is a plain set, not an append. ResDiary's
@@ -848,6 +880,14 @@ function registerResdiaryRoutes(app) {
         }
         if (!before || typeof before !== 'object' || !before.Id) {
           return res.status(404).json({ reason: 'customer_not_found', error: `customer ${customerId} not found` });
+        }
+
+        const unpreservable = unpreservableFields(before);
+        if (unpreservable.length) {
+          return res.status(409).json({
+            ok: false, reason: 'would_clear_fields', fields: unpreservable, customerId,
+            error: `This diner carries ${unpreservable.join(', ')}, which this API gives us no way to send back — changing the note would erase it. Nothing was written. Edit it in ResDiary instead.`,
+          });
         }
 
         const blob = typeof before.Comments === 'string' ? before.Comments : '';
