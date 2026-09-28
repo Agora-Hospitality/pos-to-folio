@@ -216,6 +216,7 @@ test('pickBookingReview skips bookings with no review, an empty one, or no id', 
 });
 
 test('parseEarliestDate reads every shape EarliestDate has arrived in', () => {
+  assert.strictEqual(s.parseEarliestDate({ Result: '2022-12-28T17:07:43.4300000' }), '2022-12-28'); // the live shape
   assert.strictEqual(s.parseEarliestDate('2022-03-01T00:00:00'), '2022-03-01');
   assert.strictEqual(s.parseEarliestDate({ EarliestDate: '2022-03-01T00:00:00' }), '2022-03-01');
   assert.strictEqual(s.parseEarliestDate({ Date: '2022-03-01' }), '2022-03-01');
@@ -278,6 +279,7 @@ test('GET /resdiary/booking-reviews walks the range, dedupes bookings, reports w
   assert.strictEqual((await get('from=2026-09-28&to=2026-09-01')).status, 400);
   assert.strictEqual((await get('from=nope')).status, 400);
   assert.strictEqual((await get('from=2026-09-01&by=sideways')).status, 400);
+  assert.strictEqual((await get('from=2026-09-01&by=visit')).status, 400, 'BookingDate 404s on our account');
   assert.strictEqual((await get(`from=2026-01-01&to=2026-12-31`)).status, 400, 'span over the cap');
   assert.strictEqual(s.REVIEW_SWEEP_MAX_DAYS, 62);
 });
