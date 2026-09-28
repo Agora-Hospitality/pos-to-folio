@@ -108,10 +108,11 @@ function classifyChangeRow(row) {
   return { kind: 'skip' };
 }
 
-/** ResDiary's EarliestDate answer → YYYY-MM-DD, or null. It has arrived as a
- *  bare string and wrapped under three different keys. */
+/** ResDiary's EarliestDate answer → YYYY-MM-DD, or null. The live API wraps
+ *  it as `{ Result: "2022-12-28T17:07:43.43" }` (28-09-2026); the other keys
+ *  are the shapes the docs and earlier guesses used. */
 function parseEarliestDate(earliest) {
-  const raw = typeof earliest === 'string' ? earliest : earliest?.Date || earliest?.EarliestDate || earliest?.BookingDate;
+  const raw = typeof earliest === 'string' ? earliest : earliest?.Result || earliest?.Date || earliest?.EarliestDate || earliest?.BookingDate;
   const parsed = raw ? String(raw).slice(0, 10) : null;
   return parsed && /^\d{4}-\d{2}-\d{2}$/.test(parsed) ? parsed : null;
 }
@@ -1721,15 +1722,17 @@ function registerResdiaryRoutes(app) {
    * posts to AGORA_APP_URL whoever called it, which is how a localhost test
    * put 223 rows into production on 04-09-2026.
    *
-   *   GET /resdiary/booking-reviews?from=YYYY-MM-DD&to=YYYY-MM-DD&by=created|visit|change
+   *   GET /resdiary/booking-reviews?from=YYYY-MM-DD&to=YYYY-MM-DD&by=created|change
    *
    * `by` picks the date axis: `created` walks Booking/{date} exactly as the
-   * booking backfill does (every booking once, so all of history is covered),
-   * `visit` walks BookingDate/{date}, `change` walks BookingChange/{date}.
+   * booking backfill does (every booking once, so all of history is covered);
+   * `change` walks BookingChange/{date} — a diner's review lands there on the
+   * day they write it (four of four checked, 28-09-2026), so a week of changes
+   * catches every new review. The documented BookingDate/{date} answers 404 on
+   * our account, which is why there is no visit-date axis.
    */
   const REVIEW_SWEEPS = {
     created: (day) => rd.getBookingsForDate(day),
-    visit: (day) => rd.getBookingsForVisitDate(day),
     change: (day) => rd.getBookingChanges(day),
   };
 

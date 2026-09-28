@@ -460,11 +460,6 @@ async function getBookingsForDate(dateIso) {
   return rdGet(dePath(`Booking/${dateIso}`));
 }
 
-/** Bookings in the given date's DIARY — the day they visit, per ResDiary's docs. */
-async function getBookingsForVisitDate(dateIso) {
-  return rdGet(dePath(`BookingDate/${dateIso}`));
-}
-
 async function getBookingById(bookingId) {
   return rdGet(dePath(`Booking/${bookingId}`));
 }
@@ -513,7 +508,6 @@ module.exports = {
   getCustomerById,
   getEarliestBookingDate,
   getBookingsForDate,
-  getBookingsForVisitDate,
   getBookingById,
   getBookingChanges,
   getCustomersPage,
