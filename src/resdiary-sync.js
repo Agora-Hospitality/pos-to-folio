@@ -8,6 +8,9 @@
  *   RECONCILE  BookingChange/{date} + CustomerChange/{date} for the last N
  *              days — the safety net under ResDiary's webhooks, normally
  *              pinged daily by the app's /api/cron/resdiary-reconcile.
+ *   REVIEWS    GET /resdiary/booking-reviews — the Review off each booking in a
+ *              date range, private ones included. Answers with them; pushes
+ *              nothing (the app's /api/cron/resdiary-booking-reviews writes).
  *
  * The cursor lives on the /data volume (resdiary-cursor.json) next to the
  * bridge's processed-sales.json — same survival rules. The app keeps its own
@@ -35,6 +38,9 @@ const DEFAULT_RECONCILE_DAYS = 7;
 
 const INGEST_CHUNK = 200; // rows per POST — well inside the app route's 300s budget
 const MAX_WALK_DAYS = 4000; // hard sanity cap (~11 years) against a bad floor date
+// Days per /resdiary/booking-reviews call: one ResDiary call per day at the
+// 350ms throttle, so a full span answers in about a minute.
+const REVIEW_SWEEP_MAX_DAYS = 62;
 
 // ── Small pure helpers (unit-tested) ─────────────────────────────────
 
@@ -100,6 +106,48 @@ function classifyChangeRow(row) {
   const id = row.BookingId ?? nested?.Id ?? nested?.BookingId ?? row.Id;
   if (id !== undefined && id !== null && id !== '') return { kind: 'id', id };
   return { kind: 'skip' };
+}
+
+/** ResDiary's EarliestDate answer → YYYY-MM-DD, or null. It has arrived as a
+ *  bare string and wrapped under three different keys. */
+function parseEarliestDate(earliest) {
+  const raw = typeof earliest === 'string' ? earliest : earliest?.Date || earliest?.EarliestDate || earliest?.BookingDate;
+  const parsed = raw ? String(raw).slice(0, 10) : null;
+  return parsed && /^\d{4}-\d{2}-\d{2}$/.test(parsed) ? parsed : null;
+}
+
+/**
+ * A booking's diner review, or null.
+ *
+ * Data Extract hangs a `Review` object off every booking record and every
+ * BookingChange row — text plus the five scores by name — and it is there for
+ * PRIVATE reviews too, which the Consumer API's Reviews endpoint never returns
+ * (proved 28-09-2026 on two private reviews that endpoint did not have).
+ *
+ * The review goes out verbatim beside the booking's identity: the app owns the
+ * mapping, as it does for /resdiary/reviews, so a renamed field is an app
+ * deploy rather than a Railway one. An all-empty object is not a review.
+ */
+function pickBookingReview(row) {
+  if (!row || typeof row !== 'object') return null;
+  const review = row.Review;
+  if (!review || typeof review !== 'object') return null;
+  if (Object.values(review).every((v) => v === null || v === undefined || v === '')) return null;
+  const id = row.Id ?? row.BookingId;
+  if (id === undefined || id === null || id === '') return null;
+  const name = [row.CustomerFirstName, row.CustomerSurname]
+    .filter((s) => typeof s === 'string' && s.trim())
+    .map((s) => s.trim())
+    .join(' ');
+  return {
+    bookingId: String(id),
+    reference: row.BookingReference ?? null,
+    customerId: row.CustomerId ?? null,
+    customerName: name || row.CustomerName || null,
+    status: row.Status ?? null,
+    visitDateTime: row.VisitDateTime ?? null,
+    review,
+  };
 }
 
 /** A customer record we can safely forward — a CustomerChange stub with none
@@ -405,9 +453,8 @@ async function runBackfill({ from, to, trigger = 'manual' } = {}) {
     let floor = from || cursor.floor;
     if (!floor) {
       const earliest = await rd.getEarliestBookingDate();
-      const raw = typeof earliest === 'string' ? earliest : earliest?.Date || earliest?.EarliestDate || earliest?.BookingDate;
-      const parsed = raw ? String(raw).slice(0, 10) : null;
-      if (!parsed || !/^\d{4}-\d{2}-\d{2}$/.test(parsed)) {
+      const parsed = parseEarliestDate(earliest);
+      if (!parsed) {
         throw new Error(`Could not read EarliestDate from response: ${JSON.stringify(earliest).slice(0, 200)}`);
       }
       floor = parsed;
@@ -1664,6 +1711,88 @@ function registerResdiaryRoutes(app) {
     }
   });
 
+  /**
+   * Diner reviews read off the BOOKINGS — the only place ResDiary exposes the
+   * private ones. `/resdiary/reviews` above is the Consumer API, and that
+   * returns public reviews only.
+   *
+   * Pull-shaped on purpose: it answers with the reviews and forwards nothing,
+   * so whoever asks writes to its OWN database. The push-shaped route above
+   * posts to AGORA_APP_URL whoever called it, which is how a localhost test
+   * put 223 rows into production on 04-09-2026.
+   *
+   *   GET /resdiary/booking-reviews?from=YYYY-MM-DD&to=YYYY-MM-DD&by=created|visit|change
+   *
+   * `by` picks the date axis: `created` walks Booking/{date} exactly as the
+   * booking backfill does (every booking once, so all of history is covered),
+   * `visit` walks BookingDate/{date}, `change` walks BookingChange/{date}.
+   */
+  const REVIEW_SWEEPS = {
+    created: (day) => rd.getBookingsForDate(day),
+    visit: (day) => rd.getBookingsForVisitDate(day),
+    change: (day) => rd.getBookingChanges(day),
+  };
+
+  app.get('/resdiary/booking-reviews', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.isConfigured()) return res.status(503).json({ error: 'resdiary_not_configured' });
+    const by = String(req.query.by || 'created');
+    const sweep = REVIEW_SWEEPS[by];
+    if (!sweep) return res.status(400).json({ error: `by must be one of: ${Object.keys(REVIEW_SWEEPS).join(', ')}` });
+
+    let days;
+    try {
+      const from = String(req.query.from || '');
+      days = listDatesInclusive(from, String(req.query.to || from));
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (days.length > REVIEW_SWEEP_MAX_DAYS) {
+      return res.status(400).json({ error: `At most ${REVIEW_SWEEP_MAX_DAYS} days per call — page the range` });
+    }
+
+    // Keyed on the booking: a change walk sees the same booking once per edit,
+    // and the latest row carries its current review.
+    const byBooking = new Map();
+    const perDay = [];
+    let rowsSeen = 0;
+    for (const day of days) {
+      try {
+        const rows = unwrapList(await sweep(day));
+        const found = rows.map(pickBookingReview).filter(Boolean);
+        for (const r of found) byBooking.set(r.bookingId, r);
+        rowsSeen += rows.length;
+        perDay.push({ date: day, rows: rows.length, reviews: found.length });
+      } catch (err) {
+        // Every day before this one is complete — say which, so the caller
+        // resumes from the failure instead of starting over.
+        const blocked = err instanceof rd.CloudflareBlockedError;
+        return res.status(blocked ? 502 : 500).json({
+          ok: false,
+          error: err.message,
+          failedDate: day,
+          lastDateDone: perDay.length ? perDay[perDay.length - 1].date : null,
+        });
+      }
+    }
+
+    res.json({ ok: true, by, from: days[0], to: days[days.length - 1], days: days.length, rowsSeen, reviews: [...byBooking.values()], perDay });
+  });
+
+  // The first date any booking was created — the floor for a full review backfill.
+  app.get('/resdiary/booking-earliest', async (req, res) => {
+    if (!authorized(req)) return res.status(403).json({ error: 'forbidden' });
+    if (!rd.isConfigured()) return res.status(503).json({ error: 'resdiary_not_configured' });
+    try {
+      const body = await rd.getEarliestBookingDate();
+      const earliest = parseEarliestDate(body);
+      if (!earliest) return res.status(502).json({ error: 'unreadable EarliestDate', raw: JSON.stringify(body).slice(0, 200) });
+      res.json({ ok: true, earliest });
+    } catch (err) {
+      res.status(err instanceof rd.CloudflareBlockedError ? 502 : 500).json({ error: err.message });
+    }
+  });
+
   // Shape inspection: what a change row, a full booking and a customer-change
   // row actually look like for one date. Read-only; the reconcile bug of
   // 02-09-2026 came from never having seen these.
@@ -1739,5 +1868,5 @@ module.exports = {
   runReconcile,
   getStatus,
   // exported for tests
-  _internal: { listDatesInclusive, addDaysIso, chunk, unwrapList, classifyChangeRow, classifyCustomerRow, looksLikeFullBooking, looksLikeFullCustomer, pushRun, DEFAULT_RECONCILE_DAYS },
+  _internal: { listDatesInclusive, addDaysIso, chunk, unwrapList, classifyChangeRow, classifyCustomerRow, looksLikeFullBooking, looksLikeFullCustomer, pushRun, parseEarliestDate, pickBookingReview, DEFAULT_RECONCILE_DAYS, REVIEW_SWEEP_MAX_DAYS },
 };
