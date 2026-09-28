@@ -116,6 +116,8 @@ test('resdiary routes: forbidden without token, 503 when unconfigured, status sh
     ['GET', '/resdiary/whoami'],
     ['POST', '/resdiary/backfill'],
     ['POST', '/resdiary/reconcile'],
+    ['GET', '/resdiary/booking-reviews?from=2026-09-01&to=2026-09-02'],
+    ['GET', '/resdiary/booking-earliest'],
   ]) {
     const res = await fetch(base + p, { method });
     assert.strictEqual(res.status, 403, `${method} ${p} without token`);
@@ -146,6 +148,10 @@ test('resdiary routes: forbidden without token, 503 when unconfigured, status sh
   assert.strictEqual(bf.status, 503);
   const rc = await fetch(base + '/resdiary/reconcile', { method: 'POST', headers: { 'X-Bridge-Token': 'test-admin-token' } });
   assert.strictEqual(rc.status, 503);
+  const br = await fetch(base + '/resdiary/booking-reviews?from=2026-09-01', { headers: { 'X-Bridge-Token': 'test-admin-token' } });
+  assert.strictEqual(br.status, 503);
+  const be = await fetch(base + '/resdiary/booking-earliest', { headers: { 'X-Bridge-Token': 'test-admin-token' } });
+  assert.strictEqual(be.status, 503);
 });
 
 test('run history: newest first, capped at 50, default window is 7 days', () => {
@@ -158,4 +164,120 @@ test('run history: newest first, capped at 50, default window is 7 days', () => 
   assert.deepStrictEqual(s.pushRun(null, { kind: 'backfill' }), [{ kind: 'backfill' }]);
   assert.strictEqual(s.DEFAULT_RECONCILE_DAYS, 7);
   assert.ok(Array.isArray(runs));
+});
+
+// ── booking reviews (Data Extract) ───────────────────────────────────
+
+// Synthetic — the shape of a real Data Extract booking, none of its values.
+const reviewedBooking = (id, extra = {}) => ({
+  Id: id,
+  BookingReference: `REF${id}`,
+  CustomerId: 70000 + id,
+  CustomerFirstName: ' Test ',
+  CustomerSurname: 'Diner',
+  Status: 'Closed',
+  VisitDateTime: '2026-09-23T19:00:00.0000000',
+  Review: {
+    VisitDateTime: '2026-09-23T19:00:00.0000000',
+    ReviewDateTime: '2026-09-24T11:31:25.6870000',
+    Review: 'Lovely evening.\r\nSlow service.',
+    AverageRating: 3.6,
+    LikelyToRecommendRating: 3,
+    FoodAndDrinkRating: 5,
+    AtmosphereRating: 3,
+    ServiceRating: 3,
+    ValueRating: 4,
+  },
+  ...extra,
+});
+
+test('pickBookingReview keeps the review verbatim beside the booking identity', () => {
+  const out = s.pickBookingReview(reviewedBooking(1));
+  assert.deepStrictEqual(out, {
+    bookingId: '1',
+    reference: 'REF1',
+    customerId: 70001,
+    customerName: 'Test Diner',
+    status: 'Closed',
+    visitDateTime: '2026-09-23T19:00:00.0000000',
+    review: reviewedBooking(1).Review,
+  });
+});
+
+test('pickBookingReview skips bookings with no review, an empty one, or no id', () => {
+  assert.strictEqual(s.pickBookingReview(null), null);
+  assert.strictEqual(s.pickBookingReview(reviewedBooking(2, { Review: null })), null);
+  assert.strictEqual(s.pickBookingReview(reviewedBooking(3, { Review: { Review: '', AverageRating: null } })), null);
+  assert.strictEqual(s.pickBookingReview(reviewedBooking(4, { Id: undefined })), null);
+  // A change row names the booking BookingId and carries no customer.
+  const change = s.pickBookingReview({ BookingId: 5, Review: { AverageRating: 5 } });
+  assert.strictEqual(change.bookingId, '5');
+  assert.strictEqual(change.customerName, null);
+});
+
+test('parseEarliestDate reads every shape EarliestDate has arrived in', () => {
+  assert.strictEqual(s.parseEarliestDate('2022-03-01T00:00:00'), '2022-03-01');
+  assert.strictEqual(s.parseEarliestDate({ EarliestDate: '2022-03-01T00:00:00' }), '2022-03-01');
+  assert.strictEqual(s.parseEarliestDate({ Date: '2022-03-01' }), '2022-03-01');
+  assert.strictEqual(s.parseEarliestDate({ nope: 1 }), null);
+  assert.strictEqual(s.parseEarliestDate('garbage'), null);
+});
+
+test('GET /resdiary/booking-reviews walks the range, dedupes bookings, reports where it stopped', async (t) => {
+  const express = require('express');
+  const rdMod = require('./resdiary');
+  const saved = { isConfigured: rdMod.isConfigured, getBookingsForDate: rdMod.getBookingsForDate, getBookingChanges: rdMod.getBookingChanges };
+  t.after(() => Object.assign(rdMod, saved));
+
+  const calls = [];
+  rdMod.isConfigured = () => true;
+  rdMod.getBookingsForDate = async (day) => {
+    calls.push(day);
+    if (day === '2026-09-23') return [reviewedBooking(1), reviewedBooking(2, { Review: null })];
+    if (day === '2026-09-24') return { Data: [reviewedBooking(3)] };
+    if (day === '2026-09-27') throw new Error('upstream 500');
+    return [];
+  };
+  // Two edits to the same booking in one walk: the review is reported once.
+  rdMod.getBookingChanges = async () => [
+    { BookingId: 9, Review: { AverageRating: 4 } },
+    { BookingId: 9, Review: { AverageRating: 5 } },
+  ];
+
+  process.env.BRIDGE_ADMIN_TOKEN = 'test-admin-token';
+  const app = express();
+  sync.registerResdiaryRoutes(app);
+  const server = app.listen(0);
+  t.after(() => server.close());
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const get = (q) => fetch(`${base}/resdiary/booking-reviews?${q}`, { headers: { 'X-Bridge-Token': 'test-admin-token' } });
+
+  const ok = await get('from=2026-09-23&to=2026-09-25');
+  assert.strictEqual(ok.status, 200);
+  const body = await ok.json();
+  assert.strictEqual(body.by, 'created');
+  assert.strictEqual(body.days, 3);
+  assert.strictEqual(body.rowsSeen, 3);
+  assert.deepStrictEqual(body.reviews.map((r) => r.bookingId), ['1', '3']);
+  assert.deepStrictEqual(body.perDay, [
+    { date: '2026-09-23', rows: 2, reviews: 1 },
+    { date: '2026-09-24', rows: 1, reviews: 1 },
+    { date: '2026-09-25', rows: 0, reviews: 0 },
+  ]);
+  assert.deepStrictEqual(calls, ['2026-09-23', '2026-09-24', '2026-09-25']);
+
+  const change = await (await get('from=2026-09-24&by=change')).json();
+  assert.deepStrictEqual(change.reviews.map((r) => [r.bookingId, r.review.AverageRating]), [['9', 5]]);
+
+  const failed = await get('from=2026-09-26&to=2026-09-28');
+  assert.strictEqual(failed.status, 500);
+  const fb = await failed.json();
+  assert.strictEqual(fb.failedDate, '2026-09-27');
+  assert.strictEqual(fb.lastDateDone, '2026-09-26');
+
+  assert.strictEqual((await get('from=2026-09-28&to=2026-09-01')).status, 400);
+  assert.strictEqual((await get('from=nope')).status, 400);
+  assert.strictEqual((await get('from=2026-09-01&by=sideways')).status, 400);
+  assert.strictEqual((await get(`from=2026-01-01&to=2026-12-31`)).status, 400, 'span over the cap');
+  assert.strictEqual(s.REVIEW_SWEEP_MAX_DAYS, 62);
 });
