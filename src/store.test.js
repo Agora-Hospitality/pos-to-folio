@@ -83,3 +83,45 @@ test('DATA_DIR honours the DATA_DIR env override at load time', () => {
   });
   assert.equal(out, path.resolve('/tmp/agora-volume'));
 });
+
+test('a €0 sale is never dead-lettered; a refund or a real charge is', () => {
+  const dl = new DeadLetterStore(tmpFile('dead-letter.json'));
+  dl.record('zero', { receipt: 'R0', folioAmount: 0, tipAmount: 0, totalAtStake: 0 }, 'no room matched');
+  dl.record('owed', { receipt: 'R1', folioAmount: 12, tipAmount: 0, totalAtStake: 12 }, 'no room matched');
+  dl.record('refund', { receipt: 'R2', folioAmount: -6, tipAmount: 0, totalAtStake: -6 }, 'no room matched');
+  assert.deepEqual(dl.unresolved().map((e) => e.saleId).sort(), ['owed', 'refund']);
+  assert.equal(dl.has('zero'), false);
+});
+
+test('a sparse re-record of an old €0 entry closes it instead of reopening', () => {
+  const file = tmpFile('dead-letter.json');
+  // An entry written before the €0 rule existed.
+  fs.writeFileSync(file, JSON.stringify({ old: { firstSeenAt: '2026-06-10T08:00:00Z', lastTriedAt: '2026-06-10T08:00:00Z', attempts: 3, reason: 'no room matched', receipt: 'R9', totalAtStake: 0 } }));
+  const dl = new DeadLetterStore(file);
+  dl.record('old', {}, 'sale not found in Goodtill (404)');
+  assert.equal(dl.unresolved().length, 0);
+});
+
+test('resolveZeroAmount closes legacy €0 entries and leaves the rest', () => {
+  const file = tmpFile('dead-letter.json');
+  fs.writeFileSync(file, JSON.stringify({
+    a: { firstSeenAt: '2026-06-10T08:00:00Z', reason: 'x', receipt: 'A', totalAtStake: 0 },
+    b: { firstSeenAt: '2026-06-11T08:00:00Z', reason: 'x', receipt: 'B', totalAtStake: 4 },
+    c: { firstSeenAt: '2026-06-12T08:00:00Z', reason: 'x', receipt: 'C' }, // amount unknown — not zero
+  }));
+  const dl = new DeadLetterStore(file);
+  assert.equal(dl.resolveZeroAmount(), 1);
+  assert.deepEqual(dl.unresolved().map((e) => e.saleId).sort(), ['b', 'c']);
+  // Persisted: a reload sees the same.
+  assert.equal(new DeadLetterStore(file).unresolved().length, 2);
+});
+
+test('resolveByReceipts closes only open entries with a matching receipt', () => {
+  const dl = new DeadLetterStore(tmpFile('dead-letter.json'));
+  dl.record('s1', { receipt: '111', totalAtStake: 49 }, 'no room matched');
+  dl.record('s2', { receipt: '222', totalAtStake: 28 }, 'no room matched');
+  const n = dl.resolveByReceipts(new Map([['111', 're-keyed in MEWS by hand (reconciliation 2026-07-24)'], ['999', 'x']]));
+  assert.equal(n, 1);
+  assert.deepEqual(dl.unresolved().map((e) => e.saleId), ['s2']);
+  assert.equal(dl.oldestOpenFirstSeen() !== null, true);
+});

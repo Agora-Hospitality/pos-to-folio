@@ -14,6 +14,7 @@ const { fetchSales, fetchSaleById, formatDateTime, cyprusLocalToUtcIso, extractG
 const { getResourcesAndRoomMap, getActiveReservationForRoom, findFBService, findFBAccountingCategory, addOrder, deleteExternalPayments, getOrderItems, cancelOrderItems } = require('./mews');
 const { notifyAppOfFolioSale } = require('./app-ingest');
 const { SalesStore, DeadLetterStore, DATA_DIR } = require('./store');
+const { sweepRekeyed } = require('./rekey-sweep');
 const { fullSync, getRoomByCustomerId } = require('./roster');
 
 /** @type {Map<string, string>} room name → MEWS resource ID */
@@ -58,6 +59,10 @@ const VOID_DETECT_WINDOW_HOURS = parseInt(process.env.VOID_DETECT_WINDOW_HOURS |
 // Run void detection at most once every N ms (throttle, since it makes one API call per unreversed sale)
 const VOID_DETECT_INTERVAL_MS = parseInt(process.env.VOID_DETECT_INTERVAL_MS || String(5 * 60 * 1000), 10);
 let _lastVoidDetectAt = 0;
+// How often to ask the Agora app which dead-letter sales reception re-keyed by
+// hand. The reconciliation it reads runs once a day, so hourly would be waste.
+const REKEY_SWEEP_INTERVAL_MS = parseInt(process.env.REKEY_SWEEP_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
+let _lastRekeySweepAt = 0;
 
 /**
  * Initialise the bridge: load MEWS config (rooms, services, categories),
@@ -66,6 +71,8 @@ let _lastVoidDetectAt = 0;
 async function init() {
   store = new SalesStore();
   deadLetter = new DeadLetterStore();
+  const zeroClosed = deadLetter.resolveZeroAmount();
+  if (zeroClosed) console.log(`[dead-letter] Closed ${zeroClosed} €0 entr${zeroClosed === 1 ? 'y' : 'ies'} — nothing owed`);
 
   console.log('[bridge] Loading MEWS configuration...');
   const [roomData, serviceId, catId] = await Promise.all([
@@ -188,6 +195,13 @@ async function pollOnceInner() {
     await retryDeadLetters();
   } catch (err) {
     console.error('[bridge] Dead-letter retry error:', err.message);
+  }
+
+  // Close what reception already re-keyed in MEWS (first tick after a restart,
+  // then every REKEY_SWEEP_INTERVAL_MS). sweepRekeyed never throws.
+  if (Date.now() - _lastRekeySweepAt >= REKEY_SWEEP_INTERVAL_MS) {
+    _lastRekeySweepAt = Date.now();
+    await sweepRekeyed(deadLetter);
   }
 }
 
