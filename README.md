@@ -20,6 +20,14 @@ It also **syncs occupied rooms as customer profiles** on the POS, so waiters can
 3. **Looks up the room** in MEWS and finds the active reservation
 4. **Posts an order** to the guest's folio with the itemised POS charges
 
+### Bike Rentals → Cycling list (MEWS → app)
+
+1. Every minute the bridge asks MEWS for **product service orders on the Bicycle Rental service(s)** updated in the last 3 minutes (`productServiceOrders/getAll`)
+2. On an order it has not seen, it calls the app's Cycling sync — `GET /api/cron/cycling-renters?run=1` with `Authorization: Bearer AGORA_CRON_SECRET` — at most once a minute
+3. The app's own 10-minute cron stays as the safety net; the sync is idempotent
+
+Polling, not the webhook: the MEWS General Webhook never reports product orders (30 days of logs, checked 19-10-2026). Off until `AGORA_CRON_SECRET` is set.
+
 ## Staff Workflow
 
 1. Ring up the bill in SumUp/Goodtill as usual
@@ -73,6 +81,10 @@ See `.env.example` for all available environment variables. Key settings:
 | `ROSTER_RESYNC_INTERVAL_MS` | Full roster re-sync interval (default: 600000 / 10 min) |
 | `MEWS_FB_SERVICE_ID` | Optional: explicit F&B service ID in MEWS |
 | `MEWS_FB_ACCOUNTING_CATEGORY_ID` | Optional: explicit accounting category ID |
+| `AGORA_APP_URL` | Agora app origin for the bridge's callbacks (default `https://theagorahotel.app`) |
+| `AGORA_CRON_SECRET` | The app's `CRON_SECRET` (Vercel → agora-dashboard → Production). Turns on the bike-rental watch |
+| `BIKE_RENTAL_SERVICE_IDS` | Optional: comma-separated MEWS service IDs to watch. Default: active services named like a bike |
+| `BIKE_RENTAL_POLL_MS` | Bike-rental poll interval (default: 60000) |
 
 ## API Endpoints
 
@@ -92,6 +104,7 @@ src/
 ├── roster.js     — Room roster sync (MEWS ↔ Goodtill customers)
 ├── goodtill.js   — Goodtill/SumUp POS API client (sales + customers)
 ├── mews.js       — MEWS Connector API client
+├── bike-rental-watch.js — MEWS bike orders → app Cycling sync (60 s poll)
 └── store.js      — Processed-sales dedup tracker (file-based)
 ```
 

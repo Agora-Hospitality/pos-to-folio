@@ -14,6 +14,7 @@ const { init, startPolling, stopPolling, pollOnce, getRoomMap, getResourceToRoom
 const { handleReservationUpdate, fullSync } = require('./roster');
 const { post: mewsPost } = require('./mews');
 const { ping: goodtillPing } = require('./goodtill');
+const { startBikeRentalWatch, stopBikeRentalWatch } = require('./bike-rental-watch');
 const { registerResdiaryRoutes } = require('./resdiary-sync');
 const { registerEposRoutes } = require('./resdiary-epos');
 
@@ -216,6 +217,10 @@ async function start() {
     return;
   }
 
+  // Bike rentals → the app's Cycling list. Independent of bridge init: it
+  // resolves its own MEWS service ids and retries on its own clock.
+  startBikeRentalWatch();
+
   // Then attempt to initialise MEWS config + roster sync (non-fatal)
   try {
     await init();
@@ -247,6 +252,7 @@ async function start() {
 function shutdown(signal) {
   console.log(`[server] ${signal} received, shutting down...`);
   stopPolling();
+  stopBikeRentalWatch();
   if (resyncTimer) clearInterval(resyncTimer);
   process.exit(0);
 }
