@@ -143,6 +143,13 @@ const DEAD_LETTER_PATH = path.join(DATA_DIR, 'dead-letter.json');
  * console.warn was the only trace. Entries here survive restarts, are retried
  * on a schedule, and stay visible via GET /dead-letter until resolved.
  */
+const ZERO_RESOLUTION = 'nothing owed (€0)';
+
+/** True for a recorded amount of exactly €0 (to the cent). Unknown is not zero. */
+function isZero(amount) {
+  return typeof amount === 'number' && Math.abs(amount) < 0.005;
+}
+
 class DeadLetterStore {
   /**
    * @param {string} [filePath] - Path to the JSON persistence file
@@ -193,6 +200,15 @@ class DeadLetterStore {
   record(saleId, info, reason) {
     const id = String(saleId);
     const prev = this.entries.get(id);
+    // Nothing owed, nothing to chase: a €0 folio sale (an included breakfast
+    // rung to the room) cannot lose anyone money, and 864 of them once made up
+    // 80% of the open queue. Close it instead, so the queue holds only charges
+    // that need a person.
+    const stake = info?.totalAtStake ?? prev?.totalAtStake;
+    if (isZero(stake)) {
+      if (prev && !prev.resolvedAt) this.resolve(id, ZERO_RESOLUTION);
+      return;
+    }
     const nowIso = new Date().toISOString();
     // Merge over the previous entry so a sparse re-record (e.g. a transient
     // 404 path passing info={}) never wipes receipt/customer/amount context.
@@ -224,6 +240,52 @@ class DeadLetterStore {
       entry.resolution = resolution;
       this._save();
     }
+  }
+
+  /**
+   * Close every open €0 entry — the ones recorded before record() refused them.
+   * @returns {number} how many were closed
+   */
+  resolveZeroAmount() {
+    return this._resolveWhere((e) => isZero(e.totalAtStake), () => ZERO_RESOLUTION);
+  }
+
+  /**
+   * Close open entries whose till receipt the Agora app's guest-folio
+   * reconciliation matched to a posting someone keyed into MEWS by hand.
+   * The bridge only ever closes what it posted itself, so without this a
+   * charge re-keyed at reception stayed open here forever.
+   * @param {Map<string, string>} resolutionByReceipt - receipt → resolution text
+   * @returns {number} how many were closed
+   */
+  resolveByReceipts(resolutionByReceipt) {
+    return this._resolveWhere(
+      (e) => !!e.receipt && resolutionByReceipt.has(String(e.receipt)),
+      (e) => resolutionByReceipt.get(String(e.receipt)),
+    );
+  }
+
+  /** Oldest firstSeenAt among open entries, or null. */
+  oldestOpenFirstSeen() {
+    let oldest = null;
+    for (const e of this.entries.values()) {
+      if (!e.resolvedAt && (!oldest || String(e.firstSeenAt) < oldest)) oldest = String(e.firstSeenAt);
+    }
+    return oldest;
+  }
+
+  /** Resolve every open entry matching `pred`, with one write. */
+  _resolveWhere(pred, resolutionOf) {
+    const nowIso = new Date().toISOString();
+    let n = 0;
+    for (const e of this.entries.values()) {
+      if (e.resolvedAt || !pred(e)) continue;
+      e.resolvedAt = nowIso;
+      e.resolution = resolutionOf(e);
+      n++;
+    }
+    if (n) this._save();
+    return n;
   }
 
   /** @returns {boolean} */
