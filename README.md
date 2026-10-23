@@ -23,7 +23,7 @@ It also **syncs occupied rooms as customer profiles** on the POS, so waiters can
 ### Bike Rentals → Cycling list (MEWS → app)
 
 1. Every minute the bridge asks MEWS for **product service orders on the Bicycle Rental service(s)** updated in the last 3 minutes (`productServiceOrders/getAll`)
-2. On an order it has not seen, it calls the app's Cycling sync — `GET /api/cron/cycling-renters?run=1` with `Authorization: Bearer AGORA_CRON_SECRET` — at most once a minute
+2. On an order it has not seen, it calls the app's Cycling sync — `GET /api/cron/cycling-renters?run=1` with `Authorization: Bearer AGORA_CRON_SECRET` (the app knows it as `BRIDGE_CRON_SECRET`) — at most once a minute
 3. The app's own 10-minute cron stays as the safety net; the sync is idempotent
 
 Polling, not the webhook: the MEWS General Webhook never reports product orders (30 days of logs, checked 19-10-2026). Off until `AGORA_CRON_SECRET` is set.
@@ -92,7 +92,7 @@ See `.env.example` for all available environment variables. Key settings:
 | `MEWS_FB_SERVICE_ID` | Optional: explicit F&B service ID in MEWS |
 | `MEWS_FB_ACCOUNTING_CATEGORY_ID` | Optional: explicit accounting category ID |
 | `AGORA_APP_URL` | Agora app origin for the bridge's callbacks (default `https://theagorahotel.app`) |
-| `AGORA_CRON_SECRET` | The app's `CRON_SECRET` (Vercel → agora-dashboard → Production). Turns on the bike-rental watch |
+| `AGORA_CRON_SECRET` | The app's `BRIDGE_CRON_SECRET` (Vercel → agora-dashboard → Production) — a bearer the Cycling cron route accepts besides its own `CRON_SECRET`. Turns on the bike-rental watch |
 | `BIKE_RENTAL_SERVICE_IDS` | Optional: comma-separated MEWS service IDs to watch. Default: active services named like a bike |
 | `BIKE_RENTAL_POLL_MS` | Bike-rental poll interval (default: 60000) |
 
