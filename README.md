@@ -65,6 +65,16 @@ POST https://<your-domain>/webhooks/mews
 
 Subscribe to `ServiceOrderUpdated` events. Without the webhook, the bridge still works — it re-syncs the roster every 10 minutes via polling.
 
+#### What the webhook carries
+
+Each delivery is `{ Events: [{ Discriminator, Value: { Id } }] }` — an id and nothing else, so the bridge reads the reservation back from MEWS. The log names every id and any other event type delivered:
+
+```
+[webhook] Received 2 ServiceOrderUpdated event(s): <id>, <id> · also CustomerUpdated×1
+```
+
+**Product service orders raise no event.** Bike rentals (the app's Cycling list) and the bridge's own F&B charges are product orders linked to a stay; across 30 days of logs (checked 19-10-2026) none produced a `ServiceOrderUpdated` for its own id or for the linked reservation. Anything that must react to a product order needs polling (`productServiceOrders/getAll` with `UpdatedUtc`) or a change on the Mews side.
+
 ## Configuration
 
 See `.env.example` for all available environment variables. Key settings:

@@ -17,6 +17,7 @@ const { ping: goodtillPing } = require('./goodtill');
 const { startBikeRentalWatch, stopBikeRentalWatch } = require('./bike-rental-watch');
 const { registerResdiaryRoutes } = require('./resdiary-sync');
 const { registerEposRoutes } = require('./resdiary-epos');
+const { summarizeMewsEvents, formatMewsEventSummary } = require('./mews-events');
 
 const app = express();
 app.use(express.json());
@@ -103,18 +104,15 @@ app.post('/webhooks/mews', async (req, res) => {
   // Respond immediately — process asynchronously
   res.status(200).send('OK');
 
-  const events = req.body?.Events || [];
-  const reservationIds = new Set();
+  // One line per delivery WITH the ids and any other discriminators, so a
+  // change made in MEWS can be matched to the event it did (or did not)
+  // raise — see src/mews-events.js for why that matters. Logged before the
+  // short-circuit so a delivery carrying no reservation is still visible.
+  const summary = summarizeMewsEvents(req.body?.Events);
+  if (summary.total) console.log(formatMewsEventSummary(summary));
 
-  for (const evt of events) {
-    if (evt.Discriminator === 'ServiceOrderUpdated') {
-      reservationIds.add(evt.Value?.Id);
-    }
-  }
-
+  const reservationIds = new Set(summary.serviceOrderIds);
   if (reservationIds.size === 0) return;
-
-  console.log(`[webhook] Received ${reservationIds.size} ServiceOrderUpdated event(s)`);
 
   const roomMap = getRoomMap();
   const resourceToRoom = getResourceToRoom();
