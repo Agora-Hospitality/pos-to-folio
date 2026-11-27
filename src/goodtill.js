@@ -189,6 +189,12 @@ function cyprusLocalToUtcIso(localStr) {
   return new Date(utc).toISOString();
 }
 
+/** Is this Goodtill payment method the Guest Folio tender? (CUSTOM_1 on our till.) */
+function isFolioPaymentKey(key) {
+  const k = String(key || '').toLowerCase();
+  return k === 'custom_1' || k.includes('guest folio') || k.includes('room charge');
+}
+
 /**
  * Filter sales that used "Guest Folio" as a payment method.
  * Returns objects with { sale, roomNumber } where roomNumber is extracted
@@ -211,11 +217,7 @@ function extractGuestFolioSales(sales) {
     // e.g. { "CUSTOM_1": { payment_total: "8.00", ... } }
     const payments = sale.sales_payments || {};
     const paymentKeys = Object.keys(payments);
-
-    const isFolioKey = (key) => {
-      const k = key.toLowerCase();
-      return k === 'custom_1' || k.includes('guest folio') || k.includes('room charge');
-    };
+    const isFolioKey = isFolioPaymentKey;
 
     const isGuestFolio = paymentKeys.some(isFolioKey);
     if (!isGuestFolio) continue;
@@ -303,6 +305,7 @@ module.exports = {
   formatDateTime,
   cyprusLocalToUtcIso,
   extractGuestFolioSales,
+  isFolioPaymentKey,
   parseRoomNumber,
   listCustomers,
   createCustomer,

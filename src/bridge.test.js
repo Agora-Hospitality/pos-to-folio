@@ -187,3 +187,75 @@ test('concurrent void signals cancel the MEWS order items exactly once', async (
     `expected exactly 1 cancellation, got ${mewsCalls.cancelOrderItems.length}`);
   assert.ok(bridge._getStoreForTests().get('void-race').reversedAt, 'sale must be marked reversed');
 });
+
+// ─── Split bills: the folio-routed tip goes on top of the folio share ──
+
+/** A split-bill sale shaped like Goodtill's: tips in metadata.tips_obj, each
+ *  pointing at the payment it rode on via sales_payments_history ids. */
+function splitSale(id, { total, payments, tips }) {
+  return {
+    id,
+    order_status: 'COMPLETED',
+    receipt_no: `R-${id}`,
+    customer_id: 'cust-room-11',
+    sales_date_time: '2026-11-26 20:54:34',
+    sales_payments: Object.fromEntries(payments.map((p) => [p.method, { payment_total: p.amount }])),
+    sales_payments_history: payments.map((p) => ({ id: `pay-${p.method}`, payment_method: p.method, payment_amount: p.amount })),
+    sales_details: {
+      total_after_discount: total,
+      sales_items: [{ product_name: 'Thanksgiving Menu', quantity: '2', line_total_after_discount: total }],
+      metadata: JSON.stringify({
+        tips_obj: Object.fromEntries(tips.map((t, i) => [`tip-${i}`, { amount: t.amount, sale_payment_id: `pay-${t.method}` }])),
+      }),
+    },
+  };
+}
+
+const linesOf = (order) => order.items.map((i) => [i.name.includes('Food/Drinks') ? 'food' : i.name, i.grossValue]);
+
+test('ResDiary deposit + Guest Folio + folio tip posts the whole folio share plus the tip (DEM16 #1795719274699, 26/11/2026)', async () => {
+  await ensureInit();
+  mewsCalls.addOrder.length = 0;
+  goodtillSales.set('dem16', splitSale('dem16', {
+    total: '246.00',
+    payments: [{ method: 'RESDIARY_DEPOSIT', amount: '140.00' }, { method: 'CUSTOM_1', amount: '106.00' }],
+    tips: [{ method: 'CUSTOM_1', amount: '15' }],
+  }));
+
+  await bridge.handleCompletedSale('dem16');
+
+  assert.equal(mewsCalls.addOrder.length, 1);
+  // Was €91 + €15 = €106 — the tip carved out of the folio share.
+  assert.deepEqual(linesOf(mewsCalls.addOrder[0]), [['food', 106], ['Tip', 15]]);
+});
+
+test('a tip paid on the card half of a split never reaches the folio', async () => {
+  await ensureInit();
+  mewsCalls.addOrder.length = 0;
+  goodtillSales.set('card-tip', splitSale('card-tip', {
+    total: '100.00',
+    payments: [{ method: 'CARD', amount: '50.00' }, { method: 'CUSTOM_1', amount: '50.00' }],
+    tips: [{ method: 'CARD', amount: '10' }],
+  }));
+
+  await bridge.handleCompletedSale('card-tip');
+
+  assert.deepEqual(linesOf(mewsCalls.addOrder[0]), [['food', 50]]);
+});
+
+test('a full-folio sale still posts its items plus the tip (#1777054624155 stays fixed)', async () => {
+  await ensureInit();
+  mewsCalls.addOrder.length = 0;
+  goodtillSales.set('full-tip', splitSale('full-tip', {
+    total: '78.00',
+    payments: [{ method: 'CUSTOM_1', amount: '78.00' }],
+    tips: [{ method: 'CUSTOM_1', amount: '7' }],
+  }));
+
+  await bridge.handleCompletedSale('full-tip');
+
+  const items = mewsCalls.addOrder[0].items;
+  assert.equal(items.reduce((a, i) => a + i.grossValue * i.unitCount, 0), 85);
+  assert.deepEqual(items.at(-1).name, 'Tip');
+  assert.equal(items.at(-1).grossValue, 7);
+});
