@@ -10,7 +10,7 @@
  * 5. Post the order to MEWS linked to that reservation
  */
 
-const { fetchSales, fetchSaleById, formatDateTime, cyprusLocalToUtcIso, extractGuestFolioSales, parseRoomNumber } = require('./goodtill');
+const { fetchSales, fetchSaleById, formatDateTime, cyprusLocalToUtcIso, isFolioPaymentKey, extractGuestFolioSales, parseRoomNumber } = require('./goodtill');
 const { getResourcesAndRoomMap, getActiveReservationForRoom, findFBService, findFBAccountingCategory, addOrder, deleteExternalPayments, getOrderItems, cancelOrderItems } = require('./mews');
 const { notifyAppOfFolioSale } = require('./app-ingest');
 const { SalesStore, DeadLetterStore, DATA_DIR } = require('./store');
@@ -435,7 +435,7 @@ async function processSaleInner(sale, saleId, folioAmount, otherPayments = []) {
   const saleTotal = parseFloat(
     sale.sales_details?.total_after_discount ?? sale.sales_details?.total ?? sale.total ?? '0'
   );
-  const tipTotal = extractTipAmount(sale);
+  const tipFolio = extractFolioTipAmount(sale);
   // A sale is a split only when there's a non-folio payment (Card/Cash) on the
   // sales_payments list. Don't trigger split on a folioAmount/saleTotal
   // mismatch: tips are in tips_obj metadata and never appear in sales_payments,
@@ -449,12 +449,12 @@ async function processSaleInner(sale, saleId, folioAmount, otherPayments = []) {
       console.warn(`[bridge] Sale ${saleId}: split-bill folio amount is zero, skipping`);
       return false;
     }
-    // Heuristic: tips go to the folio first (true for the common case where
-    // the guest routes the tip to their room). If a future sale routes tip to
-    // card, the total folio amount is still correct — only the food-vs-tip
-    // split within the folio lines would be off.
-    const tipFolio = Math.min(tipTotal, folioAmount);
-    const foodFolio = Math.round((folioAmount - tipFolio) * 100) / 100;
+    // folioAmount is the bill's folio share only — tips never sit in
+    // sales_payments — so the folio-routed tip goes ON TOP of it. Carving the
+    // tip out of folioAmount under-charged every split by its tip: 26/11/2026
+    // ResDiary-deposit dinners DEM16 #1795719274699 posted €91 + €15 tip for a
+    // €106 folio share (should be €106 + €15), DEM14 and GRD04 the same.
+    const foodFolio = folioAmount;
     items = [];
     if (foodFolio >= 0.005) {
       items.push({
@@ -519,15 +519,11 @@ async function processSaleInner(sale, saleId, folioAmount, otherPayments = []) {
 
   // Phase-2 guest platform: ship the itemized lines to the Agora app so the
   // Guest 360 shows spend + favourites. Fire-and-forget — never blocks money.
-  const tipFolioForApp = isSplit ? Math.min(tipTotal, folioAmount) : tipTotal;
-  const fnbGrossForApp = isSplit
-    ? Math.round((folioAmount - tipFolioForApp) * 100) / 100
-    : saleTotal;
   notifyAppOfFolioSale(sale, saleId, {
     roomNumber,
     reservation,
-    fnbGross: fnbGrossForApp,
-    tipGross: tipFolioForApp,
+    fnbGross: isSplit ? folioAmount : saleTotal,
+    tipGross: tipFolio,
     saleTimeUtcIso: cyprusLocalToUtcIso(sale.sales_date_time) || new Date().toISOString(),
   }).catch(() => {});
   return true;
@@ -540,7 +536,7 @@ async function processSaleInner(sale, saleId, folioAmount, otherPayments = []) {
 function deadLetterInfo(sale, folioAmount) {
   // folioAmount is bill-only (tips live in tips_obj metadata) — report the tip
   // too so a tip-only sale doesn't read as "nothing owed".
-  const tipAmount = extractTipAmount(sale);
+  const tipAmount = extractFolioTipAmount(sale);
   return {
     receipt: sale.receipt_no || sale.receipt_number || '',
     customer: sale.customer?.name || sale.customer_name || sale.sales_details?.customer_name || '',
@@ -644,8 +640,8 @@ function buildOrderItems(sale) {
     });
   }
 
-  // Extract tips from metadata
-  const tipTotal = extractTipAmount(sale);
+  // Tips live in metadata, not sales_items — only the folio-routed ones belong here
+  const tipTotal = extractFolioTipAmount(sale);
   if (tipTotal > 0) {
     items.push({
       name: 'Tip',
@@ -660,20 +656,30 @@ function buildOrderItems(sale) {
 }
 
 /**
- * Extract total tip amount from a Goodtill sale's metadata
+ * Tip owed on the guest folio. Goodtill keeps tips in metadata.tips_obj, each
+ * tied to the payment it rode on: tip.sale_payment_id → sales_payments_history[].id,
+ * whose payment_method says Guest Folio (CUSTOM_1) or not. A tip on a card or
+ * cash payment is settled at the till and never reaches MEWS. A tip whose
+ * payment can't be resolved counts as folio — the long-standing assumption.
  */
-function extractTipAmount(sale) {
+function extractFolioTipAmount(sale) {
   try {
     const metaStr = sale.sales_details?.metadata;
     if (!metaStr) return 0;
     const meta = typeof metaStr === 'string' ? JSON.parse(metaStr) : metaStr;
     const tipsObj = meta.tips_obj;
     if (!tipsObj || typeof tipsObj !== 'object') return 0;
+    const methodByPaymentId = new Map(
+      (Array.isArray(sale.sales_payments_history) ? sale.sales_payments_history : [])
+        .map((p) => [p.id, p.payment_method])
+    );
     let total = 0;
     for (const tip of Object.values(tipsObj)) {
+      const method = methodByPaymentId.get(tip.sale_payment_id);
+      if (method !== undefined && !isFolioPaymentKey(method)) continue;
       total += parseFloat(tip.amount || '0');
     }
-    return total;
+    return Math.round(total * 100) / 100;
   } catch {
     return 0;
   }
